@@ -1,0 +1,187 @@
+export function bindWindowsAppPanel({ container, request }) {
+  const root = document.createElement('section');
+  root.className = 'windows-app-panel';
+  root.innerHTML = [
+    '<h2>Windows 앱 제어</h2>',
+    '<p class="wa-note">현재 열려 있는 창을 골라 연결해 주세요. 연결한 창에 할 일을 채팅으로 요청할 수 있습니다.</p>',
+    '<p class="wa-status" data-status></p>',
+    '<p class="wa-note" data-guide></p>',
+    '<div class="wa-actions">',
+    '<button type="button" data-start>열린 창 불러오기</button>',
+    '<button type="button" data-stop disabled>연결 해제</button>',
+    '</div>',
+    '<label>사용할 창 <select data-windows><option value="">창 목록을 불러와 주세요</option></select></label>',
+    '<button type="button" data-select disabled>이 창 사용</button>',
+    '<p class="wa-error" data-error hidden role="alert"></p>',
+    '<details class="wa-advanced"><summary>세부 검색 · 직접 조작</summary>',
+    '<label>창 제목 필터 <input type="text" data-title autocomplete="off" spellcheck="false"></label>',
+    '<label>프로세스 <input type="text" data-process autocomplete="off" spellcheck="false"></label>',
+    '<div class="wa-actions">',
+    '<button type="button" data-find disabled>필터 적용</button>',
+    '<button type="button" data-read disabled>선택한 창 상태 읽기</button>',
+    '</div>',
+    '<label>이름 <input type="text" data-name placeholder="버튼/컨트롤 Name" autocomplete="off" spellcheck="false"></label>',
+    '<label>AutomationId <input type="text" data-aid autocomplete="off" spellcheck="false"></label>',
+    '<div class="wa-actions">',
+    '<button type="button" data-click disabled>클릭</button>',
+    '<button type="button" data-type disabled>텍스트 입력</button>',
+    '<button type="button" data-keys disabled>키</button>',
+    '<button type="button" data-wait disabled>대기</button>',
+    '</div>',
+    '<label>입력값 <input type="text" data-text autocomplete="off" spellcheck="false"></label>',
+    '<label>키 시퀀스 <input type="text" data-keyseq placeholder="{ENTER}" autocomplete="off" spellcheck="false"></label>',
+    '<label>대기 이름 포함 <input type="text" data-wait-name autocomplete="off" spellcheck="false"></label>',
+    '<pre class="wa-snap" data-snap hidden></pre>',
+    '</details>',
+  ].join('');
+  container.replaceChildren(root);
+
+  const statusEl = root.querySelector('[data-status]');
+  const guideEl = root.querySelector('[data-guide]');
+  const errorEl = root.querySelector('[data-error]');
+  const snapEl = root.querySelector('[data-snap]');
+  const titleEl = root.querySelector('[data-title]');
+  const processEl = root.querySelector('[data-process]');
+  const windowsEl = root.querySelector('[data-windows]');
+  const nameEl = root.querySelector('[data-name]');
+  const aidEl = root.querySelector('[data-aid]');
+  const textEl = root.querySelector('[data-text]');
+  const keyseqEl = root.querySelector('[data-keyseq]');
+  const waitNameEl = root.querySelector('[data-wait-name]');
+  const startBtn = root.querySelector('[data-start]');
+  const stopBtn = root.querySelector('[data-stop]');
+  const readBtn = root.querySelector('[data-read]');
+  const findBtn = root.querySelector('[data-find]');
+  const selectBtn = root.querySelector('[data-select]');
+  const clickBtn = root.querySelector('[data-click]');
+  const typeBtn = root.querySelector('[data-type]');
+  const keysBtn = root.querySelector('[data-keys]');
+  const waitBtn = root.querySelector('[data-wait]');
+  let disposed = false;
+  let appliedGeneration = -1;
+  let currentSnap = null;
+  let pending = false;
+  let actionEpoch = 0;
+  let localError = null;
+  const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+  const errorText = code => ({
+    WB_UIA_RUNTIME_NOT_FOUND: 'Windows 제어 프로그램을 찾지 못했습니다. Workbench를 다시 실행한 뒤에도 같으면 담당자에게 알려 주세요.',
+    WB_UIA_WINDOW_GONE: '선택한 창이 닫혔습니다. 열린 창 목록을 다시 불러와 주세요.',
+    WB_UIA_TIMEOUT: '창 목록이나 응답을 확인하는 데 시간이 걸립니다. 잠시 후 다시 시도해 주세요.',
+    WB_GUI_BUSY: 'AI가 답하는 중이거나 다른 작업이 진행 중이라 지금은 창을 연결할 수 없습니다. 작업이 끝난 뒤 다시 눌러 주세요.',
+    WB_UIA_TARGET_MISMATCH: 'AI가 지금 다른 창을 조작하고 있습니다. 작업이 끝난 뒤 다시 선택해 주세요.',
+  }[code] || '창을 연결하지 못했습니다. 다시 시도해 주세요. (' + code + ')');
+
+  function paint(snap) {
+    if (disposed || !snap) return;
+    if (typeof snap.generation === 'number') {
+      if (snap.generation < appliedGeneration) return;
+      appliedGeneration = snap.generation;
+    }
+    currentSnap = snap;
+    const ready = !!snap.ready;
+    const busy = pending || snap.busy;
+    guideEl.textContent = busy ? '처리 중입니다. 잠시 기다려 주세요.'
+      : !ready ? '사용할 앱을 실행한 뒤 열린 창 불러오기를 눌러 주세요.'
+      : snap.window ? '선택한 창을 채팅에서 조작할 수 있습니다. 원하는 작업을 입력해 주세요.'
+      : (snap.windows || []).length ? '목록에서 원하는 창을 고른 뒤 이 창 사용을 눌러 주세요.'
+      : snap.lastSnapshot?.evidence === 'uia-find' ? '선택할 수 있는 창이 없습니다. 사용할 앱을 실행한 뒤 목록을 다시 불러와 주세요.'
+      : '열린 창 불러오기를 눌러 주세요. 아직 연결한 창은 없습니다.';
+    statusEl.textContent = snap.window ? '연결한 창: ' + (snap.window.title || '(제목 없음)') : '연결한 창 없음';
+    if (localError || snap.lastError) { errorEl.hidden = false; errorEl.textContent = errorText(localError || snap.lastError); }
+    else { errorEl.hidden = true; errorEl.textContent = ''; }
+    if (snap.lastSnapshot) {
+      snapEl.hidden = false;
+      snapEl.textContent = JSON.stringify({
+        evidence: snap.lastSnapshot.evidence,
+        window: snap.lastSnapshot.window,
+        tree: snap.lastSnapshot.tree,
+        result: snap.lastSnapshot.result,
+        count: snap.lastSnapshot.count,
+      }, null, 2);
+    }
+    const listed = snap.windows || [];
+    const chosen = windowsEl.value || (snap.window?.hwnd ? String(snap.window.hwnd) : '');
+    const opts = listed.map(w => {
+      const label = (w.title || '(제목 없음)') + ' · ' + (w.processName || '앱') + (w.processId ? ' · PID ' + w.processId : '');
+      return '<option value="' + escapeHtml(w.hwnd) + '">' + escapeHtml(label) + '</option>';
+    });
+    windowsEl.innerHTML = '<option value="">' + (opts.length ? '사용할 창을 선택해 주세요' : '선택할 수 있는 창이 없습니다') + '</option>' + opts.join('');
+    windowsEl.value = listed.some(w => String(w.hwnd) === chosen) ? chosen : '';
+    const canAct = ready && !busy;
+    windowsEl.disabled = !canAct || !listed.length;
+    startBtn.disabled = busy || snap.status === 'stopping' || !snap.controlEnabled;
+    startBtn.textContent = listed.length ? '창 목록 새로고침' : '열린 창 불러오기';
+    stopBtn.disabled = snap.status === 'idle' || snap.status === 'stopped';
+    readBtn.disabled = !canAct || !snap.window;
+    findBtn.disabled = !canAct;
+    selectBtn.disabled = !canAct || !windowsEl.value || !!snap.lastError || !!localError;
+    clickBtn.disabled = !canAct || !snap.window;
+    typeBtn.disabled = !canAct || !snap.window;
+    keysBtn.disabled = !canAct || !snap.window;
+    waitBtn.disabled = !canAct || !snap.window;
+  }
+
+  async function run(fn, { interrupt = false } = {}) {
+    if (pending && !interrupt) return;
+    const epoch = ++actionEpoch;
+    pending = true;
+    localError = null;
+    paint(currentSnap);
+    try {
+      const snap = await fn(() => epoch === actionEpoch && !disposed);
+      if (epoch === actionEpoch) paint(snap);
+    } catch (error) {
+      if (epoch !== actionEpoch || disposed) return;
+      try { const snap = await request.state(); if (epoch === actionEpoch) paint(snap); } catch { /* keep last state */ }
+      if (epoch === actionEpoch) localError = error?.code || error?.message || error;
+    } finally {
+      if (epoch === actionEpoch) { pending = false; paint(currentSnap); }
+    }
+  }
+
+  startBtn.addEventListener('click', () => run(async isCurrent => {
+    if (!currentSnap?.ready) {
+      const started = await request.start();
+      if (!isCurrent()) return;
+      paint(started);
+    }
+    if (isCurrent()) return request.find({});
+  }));
+  // 창을 다시 고르면 이전 오류 안내는 지운다. 오류가 남아 「이 창 사용」이 계속 막히지 않게 한다.
+  windowsEl.addEventListener('change', () => {
+    if (pending) return;
+    localError = null;
+    if (currentSnap) paint({ ...currentSnap, lastError: null });
+  });
+  stopBtn.addEventListener('click', () => run(() => request.stop(), { interrupt: true }));
+  readBtn.addEventListener('click', () => run(() => request.read()));
+  findBtn.addEventListener('click', () => run(() => request.find({
+    title: titleEl.value.trim() || undefined,
+    processName: processEl.value.trim() || undefined,
+  })));
+  selectBtn.addEventListener('click', () => run(() => request.select({ hwnd: windowsEl.value })));
+  clickBtn.addEventListener('click', () => run(() => request.click({
+    name: nameEl.value.trim() || undefined,
+    automationId: aidEl.value.trim() || undefined,
+  })));
+  typeBtn.addEventListener('click', () => run(() => request.typeText({
+    text: textEl.value,
+    name: nameEl.value.trim() || undefined,
+    automationId: aidEl.value.trim() || undefined,
+  })));
+  keysBtn.addEventListener('click', () => run(() => request.sendKeys({ keys: keyseqEl.value })));
+  waitBtn.addEventListener('click', () => run(() => request.wait({
+    nameContains: waitNameEl.value.trim() || undefined,
+    titleContains: titleEl.value.trim() || undefined,
+    timeoutMs: 5000,
+  })));
+
+  return {
+    async refresh() {
+      if (disposed) return;
+      paint(await request.state());
+    },
+    dispose() { disposed = true; actionEpoch += 1; },
+  };
+}

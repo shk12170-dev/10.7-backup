@@ -1,0 +1,18 @@
+.wb-preview {
+  display: grid;
+  background: white;
+  color: #1a1a1a;
+  padding: 1rem;
+  gap: 0.75rem;
+  font-family: system-ui, sans-serif;
+  font-size: 0.95rem;
+}
+.wb-preview h2 { margin: 0; font-size: 1.25rem; }
+.wb-preview p, .wb-preview pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.wb-preview pre { overflow: auto; max-height: 400px; background: #f8f8f8; padding: 0.75rem; border-radius: 4px; }
+.wb-preview-image { display: block; width: 100%; height: auto; object-fit: contain; max-height: 480px; border-radius: 4px; }
+.wb-preview ul { list-style: none; padding: 0; margin: 0; }
+.wb-preview li { color: #8a1a1a; font-weight: 400; margin: 0.25rem 0; }
+#preview-note { font-size: 0.85rem; line-height: 1.6; }
+.file-panel .actions { flex-wrap: wrap; }
+@media (min-width: 1024px) { .file-panel { width: 360px; } }

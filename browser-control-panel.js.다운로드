@@ -1,0 +1,117 @@
+import { friendlyError } from './error-messages.js';
+export function bindBrowserControlPanel({ container, request }) {
+  const root = document.createElement('section');
+  root.className = 'browser-control-panel';
+  root.innerHTML = [
+    '<h2>실브라우저 제어</h2>',
+    '<p class="bc-note">사용자 지정 헤드 세션입니다. 정적 미리보기·헤드리스 HTML 캡처와 다릅니다.</p>',
+    '<p class="bc-status" data-status></p>',
+    '<div class="bc-actions">',
+    '<button type="button" data-start>세션 시작</button>',
+    '<button type="button" data-stop disabled>중지</button>',
+    '<button type="button" data-snapshot disabled>DOM 읽기</button>',
+    '</div>',
+    '<label>URL <input type="url" data-url placeholder="https://example.com" autocomplete="off" spellcheck="false"></label>',
+    '<div class="bc-actions">',
+    '<button type="button" data-nav disabled>이동</button>',
+    '<button type="button" data-wait disabled>텍스트 대기</button>',
+    '</div>',
+    '<label>탭 <select data-tabs></select></label>',
+    '<button type="button" data-tab disabled>탭 선택</button>',
+    '<label>선택자 <input type="text" data-selector placeholder="#id 또는 CSS" autocomplete="off" spellcheck="false"></label>',
+    '<div class="bc-actions">',
+    '<button type="button" data-click disabled>클릭</button>',
+    '<button type="button" data-fill disabled>입력</button>',
+    '</div>',
+    '<label>입력값 <input type="text" data-value autocomplete="off" spellcheck="false"></label>',
+    '<label>대기 텍스트 <input type="text" data-wait-text autocomplete="off" spellcheck="false"></label>',
+    '<p class="bc-error" data-error hidden></p>',
+    '<pre class="bc-snap" data-snap hidden></pre>',
+  ].join('');
+  container.replaceChildren(root);
+
+  const statusEl = root.querySelector('[data-status]');
+  const errorEl = root.querySelector('[data-error]');
+  const snapEl = root.querySelector('[data-snap]');
+  const urlEl = root.querySelector('[data-url]');
+  const tabsEl = root.querySelector('[data-tabs]');
+  const selectorEl = root.querySelector('[data-selector]');
+  const valueEl = root.querySelector('[data-value]');
+  const waitTextEl = root.querySelector('[data-wait-text]');
+  const startBtn = root.querySelector('[data-start]');
+  const stopBtn = root.querySelector('[data-stop]');
+  const snapBtn = root.querySelector('[data-snapshot]');
+  const navBtn = root.querySelector('[data-nav]');
+  const waitBtn = root.querySelector('[data-wait]');
+  const tabBtn = root.querySelector('[data-tab]');
+  const clickBtn = root.querySelector('[data-click]');
+  const fillBtn = root.querySelector('[data-fill]');
+  let disposed = false;
+  let appliedGeneration = -1;
+
+  function paint(snap) {
+    if (disposed || !snap) return;
+    if (typeof snap.generation === 'number') {
+      if (snap.generation < appliedGeneration) return;
+      appliedGeneration = snap.generation;
+    }
+    const ready = !!snap.ready;
+    statusEl.textContent = '상태: ' + (snap.status || 'idle')
+      + (snap.mode ? ' · ' + snap.mode : '')
+      + (snap.url ? ' · ' + snap.url : '')
+      + (snap.controlEnabled ? '' : ' · 실행 파일 필요');
+    if (snap.lastError) { errorEl.hidden = false; errorEl.textContent = friendlyError(snap.lastError); }
+    else { errorEl.hidden = true; errorEl.textContent = ''; }
+    if (snap.lastSnapshot) {
+      snapEl.hidden = false;
+      snapEl.textContent = JSON.stringify({
+        evidence: snap.lastSnapshot.evidence,
+        title: snap.lastSnapshot.title,
+        url: snap.lastSnapshot.url,
+        text: (snap.lastSnapshot.text || '').slice(0, 1200),
+        controls: snap.lastSnapshot.controls,
+      }, null, 2);
+    }
+    tabsEl.replaceChildren();
+    for (const tab of snap.tabs || []) {
+      const opt = document.createElement('option');
+      opt.value = tab.targetId;
+      opt.textContent = (tab.selected ? '✓ ' : '') + (tab.title || tab.url || tab.targetId).slice(0, 80);
+      if (tab.selected) opt.selected = true;
+      tabsEl.append(opt);
+    }
+    startBtn.disabled = !!snap.busy || ready || !snap.controlEnabled;
+    stopBtn.disabled = !!snap.busy || !ready;
+    snapBtn.disabled = !!snap.busy || !ready;
+    navBtn.disabled = !!snap.busy || !ready;
+    waitBtn.disabled = !!snap.busy || !ready;
+    tabBtn.disabled = !!snap.busy || !ready || !(snap.tabs || []).length;
+    clickBtn.disabled = !!snap.busy || !ready;
+    fillBtn.disabled = !!snap.busy || !ready;
+  }
+
+  async function run(action) {
+    try { paint(await action()); }
+    catch (error) {
+      if (!disposed) {
+        errorEl.hidden = false;
+        errorEl.textContent = friendlyError(error);
+      }
+    }
+  }
+
+  startBtn.addEventListener('click', () => run(() => request.start()));
+  stopBtn.addEventListener('click', () => run(() => request.stop()));
+  snapBtn.addEventListener('click', () => run(() => request.snapshot()));
+  navBtn.addEventListener('click', () => run(() => request.navigate({ url: urlEl.value })));
+  waitBtn.addEventListener('click', () => run(() => request.wait({ text: waitTextEl.value, timeoutMs: 8000 })));
+  tabBtn.addEventListener('click', () => run(() => request.selectTab({ targetId: tabsEl.value })));
+  clickBtn.addEventListener('click', () => run(() => request.click({ selector: selectorEl.value })));
+  fillBtn.addEventListener('click', () => run(() => request.fill({ selector: selectorEl.value, value: valueEl.value })));
+  run(() => request.state());
+
+  return {
+    refresh() { return run(() => request.state()); },
+    dispose() { disposed = true; root.remove(); },
+  };
+}

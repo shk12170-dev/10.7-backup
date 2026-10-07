@@ -1,0 +1,10 @@
+.windows-app-panel{border:1px solid #c9d2e3;border-radius:8px;padding:12px;margin:12px 0;background:#f7f9fc}
+.windows-app-panel h2{margin:0 0 6px;font-size:1.05rem}
+.windows-app-panel .wa-note{margin:0 0 8px;color:#40506a;font-size:.9rem}
+.windows-app-panel label{display:block;margin:6px 0}
+.windows-app-panel input,.windows-app-panel select{width:100%;max-width:42rem;box-sizing:border-box}
+.windows-app-panel .wa-actions{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+.windows-app-panel .wa-error{color:#a40000}
+.windows-app-panel .wa-snap{max-height:16rem;overflow:auto;background:#fff;border:1px solid #d7deea;padding:8px}
+.windows-app-panel .wa-advanced{margin-top:12px;border-top:1px solid #d7deea;padding-top:10px}
+.windows-app-panel summary{cursor:pointer;color:#40506a;font-size:.9rem}

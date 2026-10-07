@@ -1,0 +1,12 @@
+/* Qwen night-c6-mcp-style; fixed DOM selector depth, minimum width and hidden state. */
+#mcp-controls { padding: 0; margin: 0; border: 0; min-width: 0; }
+#mcp-panel { min-width: 0; padding: 8px; background: #edf5f5; color: #173640; border-radius: 6px; }
+#mcp-panel > [data-role=banner] { padding: 6px 8px; margin: 8px 0; background: #d7f2e8; border: 1px solid #68ad94; border-radius: 4px; font-weight: bold; }
+#mcp-panel > [data-role=services] { display: grid; gap: 8px; margin: 8px 0; }
+#mcp-panel [data-role=services] > [data-service] { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 6px; background: #fff; padding: 8px; border-radius: 4px; }
+#mcp-panel [data-role=service-label] { font-weight: bold; }
+#mcp-panel [data-role=status-label] { overflow-wrap: anywhere; }
+#mcp-panel button { padding: 6px; border: 1px solid #33776c; border-radius: 4px; background: #f7fcfa; color: #174d44; cursor: pointer; overflow-wrap: anywhere; }
+#mcp-panel button:disabled, #mcp-controls:disabled button { background: #ddd; border-color: #aaa; color: #555; cursor: not-allowed; }
+#mcp-panel button:focus-visible { outline: 2px solid #003366; outline-offset: 2px; }
+#mcp-panel > [data-role=failure]:not(:empty) { padding: 6px 8px; margin: 8px 0; color: #8e1515; background: #fee; border: 1px solid #b44; border-radius: 4px; font-weight: bold; }

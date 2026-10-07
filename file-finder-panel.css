@@ -1,0 +1,46 @@
+#file-finder-panel {
+  margin: 0.75rem 0 1rem;
+  padding: 0.75rem;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+}
+#file-finder-panel h2 {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+}
+.file-finder-note {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  color: #444;
+}
+.file-finder-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+#file-finder-query {
+  flex: 1 1 12rem;
+  min-width: 10rem;
+  padding: 0.35rem 0.5rem;
+}
+.file-finder-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 14rem;
+  overflow: auto;
+}
+.file-finder-results li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+  padding: 0.35rem 0;
+  border-top: 1px solid #eee;
+}
+.file-finder-results code {
+  flex: 1 1 8rem;
+  word-break: break-all;
+}

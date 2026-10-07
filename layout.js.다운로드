@@ -1,0 +1,86 @@
+// Side panels: show/hide buttons and drag-to-resize handles.
+// Widths live in CSS custom properties; nothing here touches app state or data.
+const KEY = 'wb.layout.v1';
+export const LAYOUT_DEFAULTS = Object.freeze({ left: 260, right: 320, hideLeft: false, hideRight: false });
+const MIN = 180;
+
+function readSaved(storage) {
+  try { const v = JSON.parse(storage?.getItem(KEY) || 'null'); return v && typeof v === 'object' ? v : {}; } catch { return {}; }
+}
+
+export function bindLayout(doc, storage = null) {
+  const $ = id => doc.getElementById(id);
+  const view = doc.defaultView;
+  const saved = readSaved(storage);
+  const state = { ...LAYOUT_DEFAULTS };
+  for (const key of ['left', 'right']) if (Number.isFinite(saved[key])) state[key] = saved[key];
+  for (const key of ['hideLeft', 'hideRight']) if (typeof saved[key] === 'boolean') state[key] = saved[key];
+  const viewWidth = () => view?.innerWidth || 1400;
+  // Keep the conversation usable even when both panels have been enlarged.
+  const minChatWidth = () => Math.min(480, Math.max(320, viewWidth() - 2 * MIN - 12));
+  const maxWidth = side => {
+    const other = side === 'left' ? 'right' : 'left';
+    const otherVisible = !state[other === 'left' ? 'hideLeft' : 'hideRight'];
+    const available = viewWidth() - minChatWidth() - (otherVisible ? state[other] + 6 : 0) - 6;
+    return Math.max(MIN, Math.min(Math.floor(viewWidth() * 0.45), available));
+  };
+  const clamp = (side, value) => Math.min(maxWidth(side), Math.max(MIN, Math.round(value)));
+
+  function save() { try { storage?.setItem(KEY, JSON.stringify(state)); } catch { /* layout still works without storage */ } }
+  function apply(preferredSide = 'left') {
+    // The mobile layout stacks the panels, so resizing the window must not
+    // overwrite desktop widths saved for the next wide-screen visit.
+    if (viewWidth() > 768) {
+      const order = preferredSide === 'right' ? ['right', 'left'] : ['left', 'right'];
+      for (const side of order) state[side] = clamp(side, state[side]);
+    }
+    doc.documentElement.style.setProperty('--wb-left-width', state.left + 'px');
+    doc.documentElement.style.setProperty('--wb-right-width', state.right + 'px');
+    doc.body.classList.toggle('hide-left', state.hideLeft);
+    doc.body.classList.toggle('hide-right', state.hideRight);
+    for (const [id, hidden, label] of [['toggle-left', state.hideLeft, '왼쪽 창'], ['toggle-right', state.hideRight, '오른쪽 창']]) {
+      const button = $(id); if (!button) continue;
+      button.setAttribute('aria-pressed', String(!hidden));
+      button.textContent = `${label} ${hidden ? '보이기' : '숨기기'}`;
+    }
+    for (const [id, value] of [['resize-left', state.left], ['resize-right', state.right]]) $(id)?.setAttribute('aria-valuenow', String(value));
+  }
+
+  $('toggle-left')?.addEventListener('click', () => { state.hideLeft = !state.hideLeft; apply(); save(); });
+  $('toggle-right')?.addEventListener('click', () => { state.hideRight = !state.hideRight; apply(); save(); });
+
+  function bindResizer(id, side) {
+    const handle = $(id); if (!handle) return;
+    const panel = $(side === 'left' ? 'sidebar' : 'file-panel');
+    let dragging = false;
+    const widthAt = x => {
+      const rect = panel.getBoundingClientRect();
+      return side === 'left' ? x - rect.left : rect.right - x;
+    };
+    handle.addEventListener('pointerdown', event => {
+      dragging = true; handle.setPointerCapture?.(event.pointerId); doc.body.classList.add('resizing'); event.preventDefault();
+    });
+    handle.addEventListener('pointermove', event => { if (dragging) { state[side] = widthAt(event.clientX); apply(side); } });
+    const end = () => { if (!dragging) return; dragging = false; doc.body.classList.remove('resizing'); save(); };
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
+    handle.addEventListener('keydown', event => {
+      const grow = side === 'left' ? 'ArrowRight' : 'ArrowLeft';
+      const shrink = side === 'left' ? 'ArrowLeft' : 'ArrowRight';
+      if (event.key === grow) state[side] += 20; else if (event.key === shrink) state[side] -= 20; else return;
+      event.preventDefault(); apply(side); save();
+    });
+    handle.addEventListener('dblclick', () => { state[side] = LAYOUT_DEFAULTS[side]; apply(side); save(); });
+  }
+  bindResizer('resize-left', 'left');
+  bindResizer('resize-right', 'right');
+  view?.addEventListener?.('resize', apply);
+  apply();
+  return { state, apply };
+}
+
+if (typeof document !== 'undefined' && document.getElementById('sidebar')) {
+  let storage = null;
+  try { storage = globalThis.localStorage; } catch { storage = null; }
+  bindLayout(document, storage);
+}

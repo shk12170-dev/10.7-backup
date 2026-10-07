@@ -1,0 +1,123 @@
+import { friendlyError } from './error-messages.js';
+
+// 연결이 닿지 않았다는 사실만으로 실행기 미설치·미기동·포트 오류·방화벽을 갈라낼 수 없다.
+// 그래서 이 집합은 "무엇이 잘못됐는지"가 아니라 "학생이 다음에 무엇을 확인해야 하는지"로 묶는다.
+const GENERAL_CONNECTION_FAILURES = new Set([
+  'WB_LOCAL_NETWORK_ERROR', 'WB_LOCAL_SERVER_UNAVAILABLE', 'WB_LOCAL_REQUEST_FAILED',
+  'WB_GUI_PROVIDER_CONNECT_FAILED', 'WB_GUI_PROVIDER_NO_MODELS',
+]);
+
+export function bindProviderPanel({ container, request, onChanged = () => {} }) {
+  const root = document.createElement('section'); root.className = 'provider-panel';
+  root.innerHTML = '<h2>모델 경로</h2><p data-path></p><p data-status></p><p class="provider-guide" data-guide></p><p class="provider-error" data-error hidden></p>' +
+    '<label>사용 방식<select data-mode><option value="local">로컬 우선 · 자동 도움</option><option value="cloud">CLCO · 수업용 클라우드</option><option value="personal">내 모델 연결</option></select></label>' +
+    '<label>모델<select data-model></select></label>' +
+    '<fieldset data-local><legend>이 PC의 모델 실행기</legend><label>실행 프로그램<select data-runtime><option value="existing">기존 로컬 서버 · 8083</option><option value="ollama">Ollama</option><option value="lmstudio">LM Studio</option><option value="custom">직접 지정</option></select></label>' +
+    '<label>연결 주소<input data-local-url type="text" spellcheck="false" maxlength="100" placeholder="http://127.0.0.1:8083/v1"></label><button type="button" data-local-save>주소 저장</button>' +
+    '<p data-local-current></p><p data-local-excluded hidden></p><p data-local-steps hidden></p><button type="button" data-open-setup>로컬 모델 준비 열기</button><p>실행 프로그램을 켜고 로컬 모델을 준비한 뒤 연결 확인을 누르세요. 모델 목록만 조회하며 다운로드나 추론은 시작하지 않습니다. 변경한 주소는 먼저 저장해 주세요.</p>' +
+    '<p><strong>처음 사용한다면 위의 「이 PC의 AI(로컬)」 탭에서 「준비 시작」을 누르면 설치부터 연결까지 한 번에 진행됩니다.</strong></p>' +
+    '<p>이 PC에 다운로드한 모델을 사용하고 실행기의 클라우드·원격 연결은 꺼 주세요. 로컬 주소만으로 실행기 내부의 처리 위치까지 확인할 수는 없습니다.</p></fieldset>' +
+    '<label data-auto-label><input type="checkbox" data-auto> 일반 텍스트 작업이 막히면 CLCO로 자동 도움</label>' +
+    '<div class="provider-actions"><button type="button" data-connect>연결 확인</button><button type="button" data-cancel>취소</button></div>' +
+    '<button type="button" data-clco>CLCO 연결 준비</button>' +
+    '<details data-personal><summary>내 API 모델 설정</summary></details>' +
+    '<p class="provider-hint"></p>';
+  // Keep user copy in one static template; never interpolate credentials into HTML.
+  root.querySelector('[data-personal]').innerHTML = '<summary>내 API 모델 설정</summary><p>개인 모델은 직접 선택했을 때만 사용합니다. MCP는 도구 연결 규격이며 모델 이용료와는 별개입니다. 채팅 구독만으로 API가 제공되지는 않을 수 있습니다.</p>' +
+    '<label>제공사<select data-provider><option value="openrouter">OpenRouter (무료 모델 선택 가능)</option><option value="openai">OpenAI API</option><option value="xai">xAI API</option></select></label>' +
+    '<label>API 키<input type="password" data-key autocomplete="off" spellcheck="false" maxlength="4096"></label>' +
+    '<label>처음 사용할 모델 (선택)<input data-personal-model placeholder="예: openrouter/free" autocomplete="off"></label>' +
+    '<label><input type="checkbox" data-cost> 선택한 모델의 요금과 이용 한도를 확인했습니다.</label><button type="button" data-save>내 모델 연결</button>' +
+    '<p>OpenRouter의 무료 모델은 이용량 제한과 도구 지원 여부가 다릅니다. 연결은 모델 목록만 확인하며 유료 추론을 시험하지 않습니다.</p>';
+  root.querySelector('.provider-hint').textContent = '기본 로컬 실행에는 외부 API 요금이 없습니다. CLCO는 수업용 한도를 따릅니다. API 키는 이 PC에 암호화해 보관합니다.';
+  container.replaceChildren(root);
+  const get = key => root.querySelector(`[data-${key}]`);
+  let disposed = false, lastSnap = null, running = false;
+  let revealedSetupOnce = false;   // 자동 펼침은 세션에 한 번뿐이고, 닫은 상태를 다시 열지 않는다.
+  let localDraft = false;
+  let viewRevision = 0;
+  const localDefaults = { existing: 'http://127.0.0.1:8083/v1', ollama: 'http://127.0.0.1:11434/v1', lmstudio: 'http://127.0.0.1:1234/v1' };
+  const label = id => ['aleph/auto','clco/auto'].includes(id) ? '자동 선택' : id === 'openrouter/free' || id.endsWith(':free') ? `${id} · 무료 경로` : id;
+  function paint(snap) {
+    if (disposed || !snap) return;
+    lastSnap = snap;
+    const route = snap.activeRoute || snap.mode;
+    get('path').textContent = '현재 경로: ' + ({ local: '이 PC의 오픈웨이트 모델', cloud: 'CLCO · 수업용 클라우드', personal: '내 API 모델' }[route] || route) + (route === 'cloud' && snap.mode === 'local' ? ' (자동 전환)' : '') + ` · ${label(snap.activeRouteModel || snap.model || '-')}`;
+    get('status').textContent = ({ ready: '연결됨', localSelected: '로컬 준비 · 요청할 때 실행 확인', connecting: '연결 확인 중', credentialPresent: '저장된 연결 확인 필요', disconnected: '연결 준비 필요', unreachable: '연결 확인 필요', blocked: '이용 한도 또는 권한 확인 필요', expired: '다시 승인 필요', unauthorized: '계정 권한 확인 필요', cancelled: '연결 확인 취소됨' })[snap.status] || snap.status;
+    get('guide').textContent = snap.mode === 'local' ? (snap.autoFallback ? '일반 텍스트·파일 작업은 로컬 응답이 없으면 CLCO가 한 번 돕습니다. ' : '일반 텍스트·파일 작업은 로컬 모델로 처리합니다. ') + '첨부 질문은 로컬 답변에 문제가 보일 때 선택한 첨부와 현재 질문을 CLCO로 보내 자동 재검토합니다. 이 기능에는 기기 연결이 필요합니다. PC 제어와 프로젝트 파일은 첨부 재검토에 보내지 않습니다.' : snap.mode === 'cloud' ? '수업 계정의 권한과 한도 안에서 사용합니다. 현재 대화의 일부 문맥이 CLCO로 전달됩니다.' : '선택한 개인 API만 사용합니다. 현재 대화의 일부 문맥이 해당 제공사로 전달됩니다.';
+    get('error').hidden = !snap.lastError;
+    get('error').textContent = snap.lastError ? friendlyError(snap.lastError) : '';
+    const general = snap.mode === 'local' && GENERAL_CONNECTION_FAILURES.has(snap.lastError);
+    get('local-steps').hidden = !general;
+    get('local-steps').textContent = general
+      ? '확인할 순서: ① 실행 프로그램을 켭니다 → ② 저장된 주소를 확인합니다 → ③ 「연결 확인」을 다시 누릅니다. 설치와 모델 준비는 위의 「이 PC의 AI(로컬)」 탭에서 한 번에 할 수 있습니다.'
+      : '';
+    get('mode').value = snap.mode;
+    const models = [...new Set(snap.allowedModels?.length ? snap.allowedModels : [snap.model].filter(Boolean))];
+    if (snap.model && !models.includes(snap.model)) models.unshift(snap.model);
+    get('model').replaceChildren(...models.map(id => { const opt = document.createElement('option'); opt.value = id; opt.textContent = label(id); opt.selected = id === snap.model; return opt; }));
+    get('auto').checked = snap.autoFallback !== false;
+    get('auto-label').hidden = snap.mode !== 'local';
+    get('personal').hidden = snap.mode !== 'personal';
+    get('local').hidden = snap.mode !== 'local';
+    get('local-current').textContent = '저장된 주소: ' + (snap.localBaseUrl || localDefaults.existing) + (localDraft ? ' · 입력한 변경사항은 아직 저장하지 않았습니다.' : '');
+    const excluded = snap.mode === 'local' && Number.isSafeInteger(snap.localExcludedRemoteCount) && snap.localExcludedRemoteCount > 0 ? snap.localExcludedRemoteCount : 0;
+    get('local-excluded').hidden = !excluded;
+    get('local-excluded').textContent = excluded ? '원격 실행 표시가 있는 모델 ' + excluded + '개는 로컬 목록에서 제외했습니다. 실행기에서 PC에 내려받은 모델을 선택해 주세요.' : '';
+    if (!localDraft) { get('runtime').value = snap.localRuntime || 'existing'; get('local-url').value = snap.localBaseUrl || localDefaults.existing; }
+    if (snap.mode === 'personal' && snap.status !== 'ready') get('personal').open = true;
+    get('clco').hidden = snap.mode !== 'local';
+    for (const key of ['mode','model','connect','save','auto','clco','runtime','local-url','local-save']) get(key).disabled = Boolean(snap.busy || running);
+    get('connect').disabled ||= snap.mode === 'local' && localDraft;
+    get('model').disabled ||= snap.status !== 'ready';
+    get('cancel').disabled = !snap.busy && !running;
+  }
+  async function run(action, { reveal = false } = {}) {
+    if (running || disposed) return;
+    viewRevision++;
+    running = true; if (lastSnap) paint(lastSnap);
+    try {
+      const snap = await action(); running = false; paint(snap);
+      // 실패가 예외로 오지 않고 snapshot 의 lastError 로 오는 경로가 실제 경로다.
+      if (reveal && snap?.mode === 'local' && GENERAL_CONNECTION_FAILURES.has(snap.lastError)) revealLocalSetup();
+      await onChanged();
+    }
+    catch (error) {
+      running = false;
+      try { paint(await request.state()); } catch { if (lastSnap) paint(lastSnap); }
+      // 예외 원문·주소·키를 HTML 로 넣지 않는다. 대응표가 아는 코드만 문구로 바꾼다.
+      get('error').hidden = false; get('error').textContent = friendlyError(error);
+      if (reveal && lastSnap?.mode === 'local' && GENERAL_CONNECTION_FAILURES.has(error?.code)) revealLocalSetup();
+    } finally { running = false; }
+  }
+  // 사용자가 직접 연결을 시도해 실패했을 때만, 그리고 한 번만 펼친다. 포커스는 옮기지 않는다.
+  function revealLocalSetup({ userInitiated = false } = {}) {
+    const details = typeof document !== 'undefined' && document.getElementById ? document.getElementById('local-setup') : null;
+    if (!details) return;
+    if (!userInitiated) { if (revealedSetupOnce) return; revealedSetupOnce = true; }
+    if (!details.hasAttribute('open')) details.setAttribute('open', '');
+  }
+  get('mode').addEventListener('change', () => { const mode = get('mode').value; void run(() => request.setMode(mode)); });
+  get('model').addEventListener('change', () => { const model = get('model').value; void run(() => request.setModel(model)); });
+  get('auto').addEventListener('change', () => { const enabled = get('auto').checked; void run(() => request.setAutoFallback(enabled)); });
+  get('connect').addEventListener('click', () => void run(() => request.connect(), { reveal: true }));
+  get('open-setup').addEventListener('click', () => revealLocalSetup({ userInitiated: true }));
+  get('runtime').addEventListener('change', () => {
+    const value = localDefaults[get('runtime').value]; if (value) get('local-url').value = value;
+    localDraft = true; if (lastSnap) paint(lastSnap);
+  });
+  get('local-url').addEventListener('input', () => { localDraft = true; if (lastSnap) paint(lastSnap); });
+  get('local-save').addEventListener('click', () => {
+    const body = { runtime: get('runtime').value, baseUrl: get('local-url').value.trim() };
+    void run(async () => { const snap = await request.configureLocal(body); localDraft = false; return snap; });
+  });
+  get('clco').addEventListener('click', () => void run(() => request.setMode('cloud')));
+  get('cancel').addEventListener('click', async () => { try { paint(await request.cancel()); } catch {} });
+  get('save').addEventListener('click', () => {
+    if (!get('cost').checked) { get('error').hidden = false; get('error').textContent = '선택한 모델의 요금과 이용 한도를 먼저 확인해 주세요.'; return; }
+    const body = { provider: get('provider').value, apiKey: get('key').value, ...(get('personal-model').value.trim() ? { model: get('personal-model').value.trim() } : {}) };
+    get('key').value = '';
+    void run(async () => { try { return await request.configurePersonal(body); } finally { body.apiKey = ''; } });
+  });
+  return { async refresh() { if (!running && !disposed) { const mine = ++viewRevision; const snap = await request.state(); if (mine === viewRevision && !running) paint(snap); } }, snapshot: () => lastSnap, dispose() { disposed = true; viewRevision++; root.remove(); } };
+}

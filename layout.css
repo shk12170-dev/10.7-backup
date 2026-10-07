@@ -1,0 +1,47 @@
+/* Resizable, hideable side panels and a chat-style composer. Loaded after style.css. */
+.header-right { display: flex; align-items: center; gap: 10px; }
+.layout-toggles { display: flex; gap: 6px; }
+.layout-btn { background: transparent; color: #fff; border: 1px solid rgba(255,255,255,.55); border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: .85em; }
+.layout-btn:hover { background: rgba(255,255,255,.12); }
+.layout-btn[aria-pressed="false"] { background: rgba(255,255,255,.22); }
+
+.sidebar { width: var(--wb-left-width, 260px); }
+.file-panel { width: var(--wb-right-width, 320px); }
+body.hide-left .sidebar, body.hide-left #resize-left { display: none; }
+body.hide-right .file-panel, body.hide-right #resize-right { display: none; }
+
+.resizer { flex: 0 0 6px; cursor: col-resize; background: transparent; border-left: 1px solid #ddd; position: relative; touch-action: none; }
+.resizer:hover, .resizer:focus-visible, body.resizing .resizer { background: #cfdcea; outline: none; }
+body.resizing { cursor: col-resize; user-select: none; }
+.sidebar { border-right: 0; }
+.file-panel { border-left: 0; }
+
+/* Composer: one rounded box with the text area on top and the tools below. */
+.composer { background: #f9f9f9; border-top: 0; padding: 6px 14px 14px; gap: 6px; }
+.composer-status { margin: 0 4px; font-size: .82rem; color: #56687a; line-height: 1.5; min-height: 1.2em; }
+.composer-box { border: 1px solid #c9d4df; border-radius: 14px; background: #fff; padding: 10px 12px 8px; box-shadow: 0 1px 3px rgba(20,40,60,.06); }
+.composer-box:focus-within { border-color: #7d9bbd; }
+.composer-box #prompt { width: 100%; box-sizing: border-box; border: 0; outline: none; resize: vertical; min-height: 64px; max-height: 40vh; padding: 2px; font: inherit; }
+.composer-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; margin-top: 6px; }
+.composer-toolbar #attachment-controls { flex: 1; min-width: 0; }
+.composer-toolbar #attachment-status:empty { display: none; }
+.composer-toolbar .actions { flex-shrink: 0; align-items: center; }
+.btn-quiet { background: #eef2f6; color: #173640; }
+.btn-quiet:disabled { background: #f3f5f7; color: #a5b0bb; }
+
+/* Work-in-progress bubble in the chat, like other chat assistants. */
+.message.working { background: #f6f8fb; border: 1px dashed #c3d0dd; color: #33475b; white-space: normal; }
+.working-head { display: flex; align-items: center; gap: 8px; }
+.working-text { flex: 1; }
+.working-time { color: #7a8a99; font-size: .85em; font-variant-numeric: tabular-nums; }
+.spinner { width: 14px; height: 14px; border: 2px solid #c3d0dd; border-top-color: #003366; border-radius: 50%; animation: wb-spin .9s linear infinite; flex-shrink: 0; }
+@keyframes wb-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+.working-steps { margin: 6px 0 0 22px; padding: 0; font-size: .85em; color: #56687a; }
+.working-steps:empty { display: none; }
+.working-steps li { margin: 2px 0; }
+
+@media (max-width: 768px) {
+  .resizer, .layout-toggles { display: none; }
+  .sidebar, .file-panel, body.hide-left .sidebar, body.hide-right .file-panel { display: block; width: 100%; }
+}

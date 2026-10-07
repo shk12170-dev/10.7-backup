@@ -1,0 +1,87 @@
+import { friendlyError } from './error-messages.js';
+export function bindModelToolsPanel({ container, request }) {
+  const root = document.createElement('section');
+  root.className = 'model-tools-panel';
+  root.innerHTML = [
+    '<h2>도구 연결 및 수동 점검</h2>',
+    '<p class="mt-note">일반 채팅에서도 파일·허용된 브라우저 도구를 사용합니다. Windows는 아래에 표시된, 사용자가 선택한 창만 제어합니다. 이 패널은 도구를 직접 호출해 점검하는 곳이며 자율 실행 결과는 채팅의 작업 보고서에서 확인하세요.</p>',
+    '<p class="mt-scope" data-scope></p>',
+    '<p class="mt-status" data-status></p>',
+    '<div class="mt-actions">',
+    '<button type="button" data-start>세션 시작</button>',
+    '<button type="button" data-stop disabled>중지</button>',
+    '<button type="button" data-refresh disabled>목록 새로고침</button>',
+    '</div>',
+    '<label>도구 <select data-tools></select></label>',
+    '<label>인자 JSON <textarea data-args rows="4" spellcheck="false">{}</textarea></label>',
+    '<button type="button" data-call disabled>호출</button>',
+    '<p class="mt-error" data-error hidden></p>',
+    '<pre class="mt-snap" data-snap hidden></pre>',
+  ].join('');
+  container.replaceChildren(root);
+  const statusEl = root.querySelector('[data-status]');
+  const scopeEl = root.querySelector('[data-scope]');
+  const errorEl = root.querySelector('[data-error]');
+  const snapEl = root.querySelector('[data-snap]');
+  const toolsEl = root.querySelector('[data-tools]');
+  const argsEl = root.querySelector('[data-args]');
+  const startBtn = root.querySelector('[data-start]');
+  const stopBtn = root.querySelector('[data-stop]');
+  const refreshBtn = root.querySelector('[data-refresh]');
+  const callBtn = root.querySelector('[data-call]');
+  let disposed = false;
+  let appliedGeneration = -1;
+
+  function paint(snap) {
+    if (disposed || !snap) return;
+    scopeEl.textContent = snap.selectedWindow ? 'Windows 제어 대상: ' + snap.selectedWindow.title + ' · 선택한 창을 바꾸기 전까지 유지됩니다.' : 'Windows 제어 대상 없음 · Windows 패널에서 제어할 창을 선택하세요.';
+    if (typeof snap.generation === 'number') {
+      if (snap.generation < appliedGeneration) return;
+      appliedGeneration = snap.generation;
+    }
+    statusEl.textContent = '상태: ' + (snap.status || 'idle')
+      + ' · 도구 ' + (snap.tools?.length || 0) + '개'
+      + (snap.allowCommands ? ' · 명령ON' : '')
+      + (snap.browserControlBound ? ' · 브라우저' : '')
+      + (snap.windowsAppBound ? ' · Windows' : '');
+    if (snap.lastError) { errorEl.hidden = false; errorEl.textContent = friendlyError(snap.lastError); }
+    else { errorEl.hidden = true; errorEl.textContent = ''; }
+    const prev = toolsEl.value;
+    toolsEl.innerHTML = (snap.tools || []).map(n => '<option value="' + n + '">' + n + '</option>').join('')
+      || '<option value="">(없음)</option>';
+    if (prev && (snap.tools || []).includes(prev)) toolsEl.value = prev;
+    if (snap.lastResult) {
+      snapEl.hidden = false;
+      snapEl.textContent = JSON.stringify(snap.lastResult, null, 2);
+    }
+    const ready = !!snap.ready && !snap.busy && !snap.agentActive;
+    startBtn.disabled = snap.ready || snap.busy || snap.agentActive;
+    stopBtn.disabled = snap.agentActive || snap.status === 'idle' || snap.status === 'stopped';
+    refreshBtn.disabled = !snap.ready;
+    callBtn.disabled = !ready || !toolsEl.value;
+  }
+
+  async function run(fn) {
+    try { paint(await fn()); }
+    catch (error) {
+      errorEl.hidden = false;
+      errorEl.textContent = friendlyError(error);
+      try { paint(await request.state()); } catch { /* ignore */ }
+    }
+  }
+
+  startBtn.addEventListener('click', () => run(() => request.start()));
+  stopBtn.addEventListener('click', () => run(() => request.stop()));
+  refreshBtn.addEventListener('click', () => run(() => request.state()));
+  callBtn.addEventListener('click', () => run(() => {
+    let arguments_ = {};
+    try { arguments_ = JSON.parse(argsEl.value || '{}'); }
+    catch { throw Object.assign(new Error('WB_GUI_INPUT'), { code: 'WB_GUI_INPUT' }); }
+    return request.call({ name: toolsEl.value, arguments: arguments_ });
+  }));
+
+  return {
+    async refresh() { if (!disposed) paint(await request.state()); },
+    dispose() { disposed = true; },
+  };
+}

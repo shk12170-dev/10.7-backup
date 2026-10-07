@@ -1,0 +1,106 @@
+import { createGuiApi } from './api.js';
+
+const session = document.querySelector('meta[name="wb-session"]')?.content;
+if (!session) throw new Error('Session must be nonempty string');
+
+function $(id) {
+  return document.getElementById(id);
+}
+
+export function bindFileFinderPanel({ getProjectId, showFile, status }) {
+  const root = $('file-finder-panel');
+  if (!root || root.dataset.bound === '1') return;
+  root.dataset.bound = '1';
+  root.innerHTML = `
+    <h2>파일 찾기</h2>
+    <p class="file-finder-note">프로젝트 파일을 검색하고 열거나 경로를 복사합니다. 게임/미션과 무관합니다.</p>
+    <div class="file-finder-row">
+      <input id="file-finder-query" type="search" placeholder="이름 일부 (예: notes, rules)" maxlength="200" />
+      <label class="file-finder-created"><input id="file-finder-created-only" type="checkbox" /> 내가 만든 파일만</label>
+      <button type="button" id="file-finder-search" class="btn">찾기</button>
+    </div>
+    <p id="file-finder-status" role="status"></p>
+    <ul id="file-finder-results" class="file-finder-results"></ul>
+  `;
+
+  const queryEl = $('file-finder-query');
+  const createdEl = $('file-finder-created-only');
+  const statusEl = $('file-finder-status');
+  const resultsEl = $('file-finder-results');
+
+  async function runSearch() {
+    try {
+      statusEl.textContent = '검색 중…';
+      resultsEl.replaceChildren();
+      const q = queryEl.value || '';
+      const createdOnly = createdEl.checked;
+      const params = new URLSearchParams();
+      if (q) params.set('q', q);
+      if (createdOnly) params.set('createdOnly', '1');
+      const suffix = params.toString() ? '?' + params.toString() : '';
+      const request = createGuiApi(session, globalThis.fetch, getProjectId);
+      const data = await request('/api/files/find' + suffix);
+      const files = Array.isArray(data.files) ? data.files : [];
+      statusEl.textContent = files.length
+        ? `${files.length}개 · 생성 ${data.createdCount ?? 0}`
+        : '결과 없음';
+      for (const path of files) {
+        const li = document.createElement('li');
+        const name = document.createElement('code');
+        name.textContent = path;
+        const openBtn = document.createElement('button');
+        openBtn.type = 'button';
+        openBtn.className = 'btn';
+        openBtn.textContent = '열기';
+        openBtn.addEventListener('click', async () => {
+          try {
+            await showFile(path);
+            statusEl.textContent = '열림: ' + path;
+          } catch (error) {
+            status?.(error.message);
+            statusEl.textContent = error.message;
+          }
+        });
+        const copyRel = document.createElement('button');
+        copyRel.type = 'button';
+        copyRel.className = 'btn';
+        copyRel.textContent = '경로 복사';
+        copyRel.addEventListener('click', async () => {
+          try {
+            const info = await request('/api/files/path?path=' + encodeURIComponent(path));
+            const text = info.relative || path;
+            await navigator.clipboard.writeText(text);
+            statusEl.textContent = '복사됨(상대): ' + text;
+          } catch (error) {
+            statusEl.textContent = error.message;
+          }
+        });
+        const copyAbs = document.createElement('button');
+        copyAbs.type = 'button';
+        copyAbs.className = 'btn';
+        copyAbs.textContent = '절대경로';
+        copyAbs.addEventListener('click', async () => {
+          try {
+            const info = await request('/api/files/path?path=' + encodeURIComponent(path));
+            await navigator.clipboard.writeText(info.absolute);
+            statusEl.textContent = '복사됨(절대): ' + info.absolute;
+          } catch (error) {
+            statusEl.textContent = error.message;
+          }
+        });
+        li.append(name, openBtn, copyRel, copyAbs);
+        resultsEl.append(li);
+      }
+    } catch (error) {
+      statusEl.textContent = error.message || String(error);
+    }
+  }
+
+  $('file-finder-search').addEventListener('click', () => void runSearch());
+  queryEl.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void runSearch();
+    }
+  });
+}

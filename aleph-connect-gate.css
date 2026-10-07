@@ -1,0 +1,39 @@
+.aleph-connect-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 23, 42, 0.55);
+}
+.aleph-connect-gate[hidden] { display: none !important; }
+.aleph-connect-card {
+  width: min(420px, 92vw);
+  padding: 1.5rem 1.75rem;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 12px 40px rgba(0,0,0,.18);
+  text-align: center;
+}
+.aleph-connect-card h2 { margin: 0 0 .75rem; font-size: 1.35rem; }
+.aleph-connect-card p { margin: 0 0 1rem; line-height: 1.5; color: #334155; }
+.aleph-connect-confirm { font-weight: 600; color: #0f172a; }
+.aleph-connect-error { color: #b91c1c; }
+.aleph-connect-approval { display: inline-block; margin: 0 .25rem .75rem; text-decoration: none; }
+.aleph-connect-approval[hidden] { display: none !important; }
+.aleph-connect-actions { display: flex; gap: .5rem; justify-content: center; flex-wrap: wrap; }
+.aleph-connect-local-first [data-local] { order: -1; font-weight: 700; background: #0f3b70; color: #fff; }
+.aleph-connect-local-first [data-connect] { background: #e2e8f0; color: #334155; }
+body.aleph-gated .container,
+body.aleph-gated header .badge {
+  pointer-events: none;
+  user-select: none;
+  filter: grayscale(0.15);
+}
+body.aleph-gated .aleph-connect-gate,
+body.aleph-gated .aleph-connect-gate * {
+  pointer-events: auto;
+  filter: none;
+  user-select: auto;
+}

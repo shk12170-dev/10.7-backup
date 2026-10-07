@@ -1,0 +1,942 @@
+import { createGuiApi } from './api.js';
+import { pollEvents } from './events.js';
+import { renderPreview } from './preview-view.js';
+import { bindPreviewActions } from './preview-actions.js';
+import { renderProjectOptions } from './project-options.js';
+import { bindProjectSwitch } from './project-switch-actions.js';
+import { bindProjectCreate } from './project-create.js';
+import { describeHistory } from './history-state.js';
+import { renderConversation } from './conversation-view.js';
+import { renderChatEmpty } from './chat-empty.js';
+import { chooseIntentHint, renderIntentHint, mentionedService } from './intent-hint.js';
+import { filterProjectPaths, renderFileLinks } from './file-links.js';
+import { renderChangeSummary } from './change-summary.js';
+import { renderChangeView } from './change-view.js';
+import { bindConnectionPanel } from './mcp-lab/browser-entry.mjs';
+import { describeRunResult, describeContext, chooseDeliverablePath } from './run-status.js';
+import { describeRestoreCheck } from './restore-status.js';
+import { bindAlephConnectGate } from './aleph-connect-gate.js';
+import { bindRestoreCheck } from './restore-actions.js';
+import { renderRestoreConfirmation } from './restore-confirm-view.js';
+import { bindRestoreApproval } from './restore-approval-actions.js';
+import { describeRestoreResult } from './restore-result.js';
+import { describeChangeLabel } from './change-label.js';
+import { bindFileFinderPanel } from './file-finder-panel.js';
+import { bindConnectionRecovery } from './connection-recovery.js';
+import { renderConversationHistory } from './conversation-history.js';
+import { bindServicePanel } from './service-panel.js';
+import { bindLocalSetupPanel } from './local-setup-panel.js';
+import { bindAttachmentPanel } from './attachment-panel.js';
+import { clipboardFiles } from './clipboard-files.js';
+import { renderUpdateBanner } from './update-banner.js';
+import { renderUsageLine } from './usage-line.js';
+import { friendlyError, FRIENDLY_ERRORS as FRIENDLY_WB } from './error-messages.js';
+import { createToaster, bindDialog, bindProjectMenu, paintModelChip } from './shell.js';
+const $ = id => document.getElementById(id);
+const toast = createToaster($('toast-root'));
+const modelDialog = bindDialog($('model-dialog'), { onOpen: () => { toast.dismissKey('local-check'); void localSetupPanel?.refresh().catch(() => {}); } });
+const connectionsDialog = bindDialog($('connections-dialog'));
+const settingsDialog = bindDialog($('settings-dialog'));
+let lastProviderSnap = null, localSetupSummary = { state: 'idle' }, localAutoChecked = false, usageRedrawTimer = null;
+const PROVIDER_PROBLEMS = new Set(['disconnected', 'unreachable', 'blocked', 'expired', 'unauthorized', 'paused']);
+const modelName = id => ({ 'aleph/auto': '자동 선택', 'clco/auto': '자동 선택', 'qwen3.5:9b': 'Qwen3.5 9B', 'qwen3.5:4b': 'Qwen3.5 4B' })[id] ?? id ?? '';
+// 모델 상태 칸: 로컬 준비가 진행 중이거나 실패했으면 그것을, 아니면 현재 연결 상태를 보여 준다.
+// 대화 첫 화면과 아래 안내 줄도 같은 상태를 따라간다.
+let aiState = { state: 'run', text: 'AI 연결을 확인하고 있습니다.' };
+const IDLE_READY = '준비됐습니다. 만들고 싶은 것을 입력하세요.';
+const IDLE_NEED_AI = 'AI 연결이 필요합니다. 왼쪽 아래 AI 칸을 눌러 연결해 주세요.';
+function idleStatus() { const el = $('status'); el.textContent = aiState.state === 'ok' ? IDLE_READY : aiState.state === 'run' ? '연결을 확인하고 있습니다.' : IDLE_NEED_AI; el.dataset.idle = '1'; }
+function paintEmpty() {
+  const chat = $('chat');
+  if (chat.querySelector('.message')) { chat.querySelector('.chat-empty')?.remove(); return; }
+  renderChatEmpty(chat, { ai: aiState, onConnect: openModelDialog,
+    onPick: text => { const box = $('prompt'); box.value = text; box.focus(); box.setSelectionRange?.(text.length, text.length); } });
+}
+function paintAi(chip, snap) {
+  const where = snap && (snap.activeRoute || snap.mode) === 'local' ? '이 PC의 AI' : snap?.mode === 'personal' ? '내 API 모델' : '수업용 AI';
+  aiState = chip.state === 'ok' ? { state: 'ok', text: `${where}(${chip.detail || modelName(snap?.model)})에 연결되어 있습니다.` }
+    : chip.state === 'run' ? { state: 'run', text: localSetupSummary.state === 'run' ? '이 PC의 AI를 준비하고 있습니다. 끝나면 바로 대화할 수 있습니다.' : 'AI 연결을 확인하고 있습니다.' }
+    : { state: 'err', text: '아직 AI가 연결되지 않았습니다. 연결한 뒤 대화를 시작하세요.' };
+  // 연결이 되면 「연결이 안 됐다」는 알림은 더 이상 맞지 않으므로 닫는다.
+  if (aiState.state === 'ok') { toast.dismissKey('local-check'); toast.dismissKey('ai-missing'); toast.dismissKey('cloud'); }
+  if ($('status').dataset.idle === '1') idleStatus();
+  paintEmpty();
+}
+function paintChip() {
+  if (localSetupSummary.state === 'run' || localSetupSummary.state === 'err') { paintModelChip($('model-chip'), localSetupSummary); paintAi(localSetupSummary, lastProviderSnap); return; }
+  const snap = lastProviderSnap;
+  if (!snap) { const idle = { state: 'run', title: 'AI 연결을 확인하고 있습니다' }; paintModelChip($('model-chip'), idle); paintAi(idle, null); return; }
+  const route = snap.activeRoute || snap.mode;
+  const where = route === 'local' ? '이 PC의 AI' : route === 'personal' ? '내 API 모델' : '수업용 AI';
+  const detail = (route === 'local' ? '' : route === 'cloud' ? 'CLCO · ' : '') + modelName(snap.activeRouteModel || snap.model) + (route === 'cloud' && snap.mode === 'local' ? ' · 자동 도움 중' : '');
+  let chip;
+  if (snap.status === 'ready') chip = { state: 'ok', title: where + ' 연결됨', detail };
+  // localSelected는 "골라 두기만 한" 상태다. 실제로 대답하는지 확인하기 전에는 연결됐다고 쓰지 않는다.
+  else if (snap.busy || snap.status === 'connecting' || snap.status === 'credentialPresent' || snap.status === 'localSelected') chip = { state: 'run', title: where + ' 연결을 확인하고 있습니다', detail };
+  // 수업용 AI 가 잠시 못 받을 뿐이고 이 PC 의 AI 가 대신 답할 수 있으면 오류로 보이지 않게 한다(오너 신고 2026-09-26).
+  else if (snap.cloudPaused) chip = snap.lastError === 'WB_CLCO_SESSION_CLOSED'
+    ? { state: 'idle', title: '수업용 AI 쉬는 시간', detail: '08~23시에 열립니다 · 지금은 이 PC의 AI가 답합니다' }
+    : { state: 'idle', title: '수업용 AI 잠시 멈춤', detail: '지금은 이 PC의 AI가 대신 답합니다' };
+  // 이 PC 의 AI 가 없어도 「수업 시간 밖」은 오류가 아니다. 열리면 자동으로 다시 붙는다(2026-09-27).
+  else if (snap.status === 'paused') chip = { state: 'idle', title: '수업용 AI 쉬는 시간', detail: '08~23시에 열립니다 · 열리면 자동으로 다시 연결합니다' };
+  else if (PROVIDER_PROBLEMS.has(snap.status) || snap.lastError) chip = { state: 'err', title: 'AI에 연결하지 못했습니다', detail: '눌러서 해결 방법 보기' };
+  else chip = { state: 'idle', title: where, detail };
+  paintModelChip($('model-chip'), chip);
+  paintAi(chip, snap);
+  const cloudStatus = $('cloud-status');
+  if (cloudStatus) cloudStatus.textContent = snap.mode === 'cloud' ? (snap.status === 'ready' ? '지금 수업용 AI를 쓰고 있습니다.'
+    : snap.cloudPaused ? (snap.lastError === 'WB_CLCO_SESSION_CLOSED' ? '지금은 수업용 AI가 열리지 않는 시간입니다(매일 08~23시). 그동안 보내는 질문은 이 PC의 AI가 답합니다.' : '수업용 AI가 잠시 답할 수 없습니다. 그동안 보내는 질문은 이 PC의 AI가 답합니다.')
+    : '수업용 AI 연결을 확인해야 합니다. 아래 버튼을 눌러 주세요.') : '';
+}
+function openModelDialog() {
+  const snap = lastProviderSnap;
+  const tab = localSetupSummary.state === 'run' || localSetupSummary.state === 'err' ? 'local'
+    : snap?.mode === 'personal' ? 'advanced' : snap?.mode === 'cloud' ? 'cloud' : 'local';
+  modelDialog.open(tab);
+}
+async function useCloud() {
+  try {
+    await request('/api/provider/mode', { mode: 'cloud' });
+    let snap = await request('/api/provider');
+    if (snap.status !== 'ready') snap = await request('/api/provider/connect', {});
+    await refreshProvider(); await alephConnectGate?.sync({ recheck: true });
+    if (snap.status === 'ready') { toast.show({ kind: 'ok', title: '수업용 AI로 바꿨습니다', detail: '바로 대화를 이어서 할 수 있습니다.' }); modelDialog.close(); }
+    else if (snap.needsCredential) {
+      // 아직 이 PC를 ALEPH에 연결하지 않았다. 가운데 연결 안내 창이 보이도록 대화 상자를 닫는다.
+      modelDialog.close();
+      toast.show({ kind: 'info', key: 'cloud', title: '수업용 AI를 쓰려면 ALEPH 연결이 필요합니다', detail: '가운데 창의 「ALEPH로 연결」을 눌러 승인하면 됩니다. 이 PC의 AI로 돌아가려면 「로컬 모드로 돌아가기」를 누르세요.', timeoutMs: 10000 });
+    }
+    else if (lastProviderSnap?.cloudPaused) { toast.show({ kind: 'info', key: 'cloud', title: lastProviderSnap.lastError === 'WB_CLCO_SESSION_CLOSED' ? '지금은 수업용 AI가 쉬는 시간입니다' : '수업용 AI가 잠시 답할 수 없습니다', detail: '그동안 보내는 질문은 이 PC의 AI가 답합니다. 수업용 AI가 다시 열리면 자동으로 수업용 AI가 답합니다.', timeoutMs: 8000 }); modelDialog.close(); }
+    else toast.show({ kind: 'err', key: 'cloud', title: '수업용 AI에 연결하지 못했습니다', detail: snap.lastError ? friendlyError(snap.lastError) : '인터넷 연결을 확인한 뒤 다시 시도해 주세요. 그동안 이 PC의 AI로 계속 작업할 수 있습니다.' });
+  } catch (error) { toast.show({ kind: 'err', title: '수업용 AI로 바꾸지 못했습니다', detail: friendlyError(error) }); }
+}
+$('model-chip').addEventListener('click', openModelDialog);
+$('open-connections').addEventListener('click', () => connectionsDialog.open());
+$('open-settings').addEventListener('click', () => settingsDialog.open());
+$('use-cloud').addEventListener('click', () => void useCloud());
+// 직접 설정 화면의 「로컬 모델 준비 열기」는 같은 창의 「이 PC의 AI」 탭으로 옮긴다.
+$('provider-panel').addEventListener('click', event => { if (event.target?.closest?.('[data-open-setup]')) modelDialog.tab('local'); });
+let projectId = '', projectSelectionEnabled = false;
+const drafts = new Map();
+const request = createGuiApi(document.querySelector('meta[name="wb-session"]').content, globalThis.fetch, () => projectId);
+let busy = false, selectedFile = null, availableFiles = [], lastChangedFiles = [], previewEnabled = false, mcpEnabled = false, mcpPanel = null, providerPanel = null, enrollmentPanel = null;
+let selectedChangeId = null, restoreDispose = null, runPanel = null, browserControlPanel = null, windowsAppPanel = null, modelToolsPanel = null;
+let restoreEnabled=false,approvalDispose=null,alephConnectGate=null;
+let sendInFlight = false, reconnectInProgress = false, connectionRecovery = null;
+let servicePanel = null;
+let localSetupPanel = null;
+let activeConversationId = null, attachmentProjectId = null, attachmentRead = 0, attachmentReady = false, attachmentRequestInFlight = false;
+const attachmentPanel = bindAttachmentPanel({
+  container: $('attachment-panel'), getConversationId: () => activeConversationId, compact: true, autoUpload: true,
+  request: async (path, body, options) => {
+    if (!attachmentReady || busy || sendInFlight || reconnectInProgress || attachmentRequestInFlight) throw new Error('WB_GUI_BUSY');
+    const expectedProjectId = projectId, expectedConversationId = activeConversationId;
+    if (body?.conversationId !== expectedConversationId) throw new Error('WB_GUI_PROJECT_STALE');
+    attachmentRequestInFlight = true;
+    controls(busy);
+    try {
+      const result = await request(path, body, options);
+      if (projectId !== expectedProjectId || activeConversationId !== expectedConversationId) throw new Error('WB_GUI_PROJECT_STALE');
+      return result;
+    } finally {
+      attachmentRequestInFlight = false;
+      controls(busy);
+    }
+  },
+});
+
+// While a request runs, the same status also appears in a work bubble inside the chat.
+let activeWork = null;
+const status = text => { $('status').textContent = text; $('status').dataset.idle = '0'; if (activeWork) activeWork.text.textContent = text; };
+const TOOL_LABELS = { read_file: '파일 읽기', list_files: '파일 목록 보기', write_file: '파일 만들기·저장', create_file: '파일 만들기', edit_file: '파일 고치기', apply_patch: '파일 고치기', run_command: '명령 실행', browser_open: '브라우저로 열기', browser_snapshot: '화면 확인', click: '화면 누르기', type: '글자 입력' };
+function elapsedLabel(ms) { const s = Math.floor(ms / 1000); return s < 60 ? s + '초' : Math.floor(s / 60) + '분 ' + (s % 60) + '초'; }
+function startWork() {
+  endWork();
+  const el = document.createElement('div');
+  el.className = 'message assistant working';
+  el.innerHTML = '<div class="working-head"><span class="spinner" aria-hidden="true"></span><span class="working-text"></span><span class="working-time"></span></div><ol class="working-steps"></ol>';
+  $('chat').append(el); $('chat').scrollTop = $('chat').scrollHeight;
+  const started = Date.now();
+  const time = el.querySelector('.working-time');
+  const timer = setInterval(() => { time.textContent = elapsedLabel(Date.now() - started); }, 1000);
+  activeWork = { el, text: el.querySelector('.working-text'), steps: el.querySelector('.working-steps'), timer };
+}
+function workStep(text) {
+  if (!activeWork) return;
+  const item = document.createElement('li'); item.textContent = text; activeWork.steps.append(item);
+  while (activeWork.steps.childElementCount > 6) activeWork.steps.firstElementChild.remove();
+  $('chat').scrollTop = $('chat').scrollHeight;
+}
+function endWork() { if (!activeWork) return; clearInterval(activeWork.timer); activeWork.el.remove(); activeWork = null; }
+function controls(value) { busy = value; const held = value || sendInFlight || reconnectInProgress || attachmentRequestInFlight; $('send').disabled = held; $('reset').disabled = held; $('new-conversation').disabled = held; $('stop').disabled = !value; $('attachment-controls').disabled = held || !attachmentReady || !activeConversationId; $('preview-open').disabled = held || !previewEnabled; $('preview-refresh').disabled = held || !previewEnabled; $('project-select').disabled = held || !projectSelectionEnabled; $('project-switch').disabled = held || !projectSelectionEnabled; $('mcp-controls').disabled = held || !mcpEnabled; $('restore-check').disabled = held || !selectedChangeId; $('restore-prepare').disabled=held||!restoreEnabled||!selectedChangeId; const openBtn = $('file-open-browser'); if (openBtn) openBtn.disabled = held || !openBtn.dataset?.path;
+  // 안내의 「파일 첨부하기」는 첨부 칸이 열려 있을 때만 누를 수 있다(대답하는 동안에는 첨부 칸이 잠긴다).
+  const hintAttach = $('intent-hint-bar')?.querySelector?.('[data-hint-action="attach"]'); if (hintAttach) hintAttach.disabled = $('attachment-controls').disabled; }
+function message(role, text) { $('chat').querySelector('.chat-empty')?.remove(); const el = document.createElement('div'); el.className = 'message ' + role; el.textContent = text; $('chat').append(el); $('chat').scrollTop = $('chat').scrollHeight; return el; }
+let fileRead = 0, changeRead = 0;
+function clearApproval(){approvalDispose?.();approvalDispose=null;$('restore-confirm').replaceChildren();$('restore-result').textContent='';}
+function clearRestoreCheck() { clearApproval();restoreDispose?.(); restoreDispose=null; selectedChangeId=null; $('restore-check').disabled=true; $('restore-prepare').disabled=true; $('restore-check-status').textContent=''; }
+function clearProjectView() { clearIntentHint(); fileRead++; changeRead++; attachmentRead++; attachmentReady = false; activeConversationId = null; attachmentProjectId = null; attachmentPanel.rebind({ projectId: null, conversationId: null }); controls(busy); clearRestoreCheck(); mcpPanel?.dispose(); mcpPanel=null; $('mcp-panel').replaceChildren(); selectedFile = null; availableFiles = []; lastChangedFiles = []; $('file-name').textContent = '파일'; $('file-content').textContent = ''; paintFilePathMeta(null); $('files').replaceChildren(); const _fl=$('file-links-panel'); if (_fl) _fl.replaceChildren(); renderPreview($('preview-content'), null); renderChangeSummary($('changes-summary'), []); renderChangeView($('change-detail'), null); $('changes-list').replaceChildren(); $('changes-limit').textContent = ''; }
+function selectChange(snapshot) {
+  clearRestoreCheck(); selectedChangeId=snapshot.id; renderChangeView($('change-detail'),snapshot);
+  const id=projectId, changeId=snapshot.id;
+  const bound=createGuiApi(document.querySelector('meta[name="wb-session"]').content,globalThis.fetch,()=>id);
+  restoreDispose=bindRestoreCheck({button:$('restore-check'),chooseId:()=>selectedChangeId,
+    request:async url=>{
+      if(busy||projectId!==id||selectedChangeId!==changeId)throw new Error('WB_GUI_BUSY');controls(true);
+      try{return await bound(url);}finally{if(projectId===id)controls(false);}
+    },
+    onResult:result=>{if(projectId===id&&selectedChangeId===changeId)$('restore-check-status').textContent=describeRestoreCheck(result);},
+    onError:text=>{if(projectId===id&&selectedChangeId===changeId)$('restore-check-status').textContent=text;},
+  });
+  $('restore-check').disabled=busy;
+  $('restore-prepare').disabled=busy||!restoreEnabled;
+}
+$('restore-prepare').addEventListener('click',async()=>{
+  if(busy||!restoreEnabled||!selectedChangeId)return;
+  clearApproval();const id=projectId,changeId=selectedChangeId;controls(true);
+  const bound=createGuiApi(document.querySelector('meta[name="wb-session"]').content,globalThis.fetch,()=>id);
+  try{
+    const prepared=await bound('/api/restore-prepare',{id:changeId});
+    if(id!==projectId||changeId!==selectedChangeId)return;
+    if(prepared?.ok!==true||prepared.id!==changeId||typeof prepared.challenge!=='string'||!/^[a-f0-9]{64}$/.test(prepared.challenge))throw new Error('WB_GUI_INPUT');
+    const fields=renderRestoreConfirmation($('restore-confirm'),prepared);if(!fields.checkbox)throw new Error('WB_GUI_INPUT');
+    $('restore-result').textContent='확인 정보는 60초 동안 한 번만 사용할 수 있습니다.';
+    approvalDispose=bindRestoreApproval({...fields,
+      submit:async()=>{
+        if(busy||projectId!==id||selectedChangeId!==changeId)throw new Error('WB_GUI_BUSY');controls(true);
+        try{return await bound('/api/restore',{id:changeId,challenge:prepared.challenge,confirmed:true});}finally{if(projectId===id)controls(false);}
+      },
+      onResult:result=>{
+        if(id!==projectId||changeId!==selectedChangeId)return;
+        $('restore-result').textContent=describeRestoreResult(result);
+        refresh().catch(()=>status('되돌리기 후 목록을 갱신하지 못했습니다. 파일을 확인하세요.'));
+      },onError:text=>{if(id===projectId&&changeId===selectedChangeId)$('restore-result').textContent=text;},
+    });
+  }catch{$('restore-result').textContent='이 기록으로 되돌리기를 준비하지 못했습니다. 파일 상태와 실행 옵션을 확인하세요.';}
+  finally{if(id===projectId)controls(false);}
+});
+async function loadEnrollmentPanel() {
+  try {
+    const mod = await import('./enrollment-panel.js');
+    return mod.bindEnrollmentPanel;
+  } catch {
+    return null;
+  }
+}
+async function loadRunPanel() {
+  try {
+    const mod = await import('./run-panel.js');
+    return mod.bindRunPanel;
+  } catch {
+    return null;
+  }
+}
+async function loadBrowserControlPanel() {
+  try {
+    const mod = await import('./browser-control-panel.js');
+    return mod.bindBrowserControlPanel;
+  } catch {
+    return null;
+  }
+}
+async function loadWindowsAppPanel() {
+  try {
+    const mod = await import('./windows-app-panel.js');
+    return mod.bindWindowsAppPanel;
+  } catch {
+    return null;
+  }
+}
+async function loadModelToolsPanel() {
+  try {
+    const mod = await import('./model-tools-panel.js');
+    return mod.bindModelToolsPanel;
+  } catch {
+    return null;
+  }
+}
+
+async function refreshRun() {
+  const mount = $('run-panel');
+  if (!mount) return;
+  if (!runPanel) {
+    const bindRunPanel = await loadRunPanel();
+    if (!bindRunPanel) { mount.hidden = true; return; }
+    runPanel = bindRunPanel({
+      container: mount,
+      request: {
+        state: () => request('/api/run'),
+        start: (body) => request('/api/run/start', body),
+        stop: () => request('/api/run/stop', {}),
+      },
+    });
+  }
+  await runPanel.refresh();
+}
+async function refreshBrowserControl() {
+  const mount = $('browser-control-panel');
+  if (!mount) return;
+  if (!browserControlPanel) {
+    const bind = await loadBrowserControlPanel();
+    if (!bind) { mount.hidden = true; return; }
+    browserControlPanel = bind({
+      container: mount,
+      request: {
+        state: () => request('/api/browser-control'),
+        start: () => request('/api/browser-control/start', {}),
+        stop: () => request('/api/browser-control/stop', {}),
+        navigate: (body) => request('/api/browser-control/navigate', body),
+        selectTab: (body) => request('/api/browser-control/tab', body),
+        snapshot: () => request('/api/browser-control/snapshot', {}),
+        click: (body) => request('/api/browser-control/click', body),
+        fill: (body) => request('/api/browser-control/fill', body),
+        wait: (body) => request('/api/browser-control/wait', body),
+      },
+    });
+  }
+  await browserControlPanel.refresh();
+}
+
+async function refreshWindowsApp() {
+  const mount = $('windows-app-panel');
+  if (!mount) return;
+  if (!windowsAppPanel) {
+    const bind = await loadWindowsAppPanel();
+    if (!bind) { mount.hidden = true; return; }
+    windowsAppPanel = bind({
+      container: mount,
+      request: {
+        state: () => request('/api/windows-app'),
+        start: () => request('/api/windows-app/start', {}),
+        stop: () => request('/api/windows-app/stop', {}),
+        find: (body) => request('/api/windows-app/find', body),
+        select: (body) => request('/api/windows-app/select', body),
+        read: () => request('/api/windows-app/read', {}),
+        click: (body) => request('/api/windows-app/click', body),
+        typeText: (body) => request('/api/windows-app/type', body),
+        sendKeys: (body) => request('/api/windows-app/keys', body),
+        wait: (body) => request('/api/windows-app/wait', body),
+      },
+    });
+  }
+  await windowsAppPanel.refresh();
+}
+
+async function refreshModelTools() {
+  const mount = $('model-tools-panel');
+  if (!mount) return;
+  if (!modelToolsPanel) {
+    const bind = await loadModelToolsPanel();
+    if (!bind) { mount.hidden = true; return; }
+    modelToolsPanel = bind({
+      container: mount,
+      request: {
+        state: () => request('/api/model-tools'),
+        start: () => request('/api/model-tools/start', {}),
+        stop: () => request('/api/model-tools/stop', {}),
+        call: (body) => request('/api/model-tools/call', body),
+      },
+    });
+  }
+  await modelToolsPanel.refresh();
+}
+async function refreshEnrollment() {
+  const mount = $('enrollment-panel');
+  if (!mount) return;
+  if (!enrollmentPanel) {
+    const bindEnrollmentPanel = await loadEnrollmentPanel();
+    if (!bindEnrollmentPanel) { mount.hidden = true; return; }
+    enrollmentPanel = bindEnrollmentPanel({
+      container: mount,
+      request: {
+        state: () => request('/api/enrollment'),
+        start: () => request('/api/enrollment/start', {}),
+        cancel: () => request('/api/enrollment/cancel', {}),
+        useLocal: async () => { await request('/api/provider/mode', { mode: 'local' }); await refreshProvider(); },
+      },
+    });
+  }
+  await enrollmentPanel.refresh();
+}
+async function loadProviderPanel() {
+  try {
+    const mod = await import('./provider-panel.js');
+    return mod.bindProviderPanel;
+  } catch {
+    return null;
+  }
+}
+async function refreshProvider() {
+  const mount = $('provider-panel');
+  if (!mount) return;
+  if (!providerPanel) {
+    const bindProviderPanel = await loadProviderPanel();
+    if (!bindProviderPanel) { mount.hidden = true; return; }
+    providerPanel = bindProviderPanel({
+      container: $('provider-panel'),
+      request: {
+        state: () => request('/api/provider'),
+        connect: () => request('/api/provider/connect', {}),
+        setMode: (mode) => request('/api/provider/mode', { mode }),
+        setModel: (model) => request('/api/provider/model', { model }),
+        cancel: () => request('/api/provider/cancel', {}),
+        setAutoFallback: enabled => request('/api/provider/fallback', { enabled }),
+        configurePersonal: body => request('/api/provider/personal', body),
+        configureLocal: body => request('/api/provider/local', body),
+      },
+      onChanged: async () => { lastProviderSnap = providerPanel?.snapshot?.() ?? lastProviderSnap; paintChip(); await alephConnectGate?.sync({ recheck: true }); const state = await request('/api/state'); $('mode-label').textContent = state.mode === 'local' ? '로컬 우선' : state.mode === 'personal' ? '개인 모델' : 'CLCO'; $('model-label').textContent = state.model === 'aleph/auto' || state.model === 'clco/auto' ? '자동 선택' : state.model; },
+    });
+  }
+  await providerPanel.refresh();
+  lastProviderSnap = providerPanel.snapshot?.() ?? lastProviderSnap;
+  // 처음 켰을 때 로컬 모델을 골라 두기만 한 상태면 한 번 확인한다(모델 목록만 조회, 다운로드·추론 없음).
+  // 새로 설치한 PC에서 "연결됨"처럼 보이다가 첫 질문에서야 실패하던 문제를 막는다.
+  // 수업용 AI 가 기본으로 열렸는데(연결 정보는 있음) 아직 확인 전이면 한 번 연결해 둔다(모델 목록만 조회).
+  if (!localAutoChecked && lastProviderSnap?.mode === 'cloud' && lastProviderSnap.status === 'credentialPresent' && !lastProviderSnap.busy) {
+    localAutoChecked = true;
+    try { await request('/api/provider/connect', {}); } catch { /* 결과는 아래 상태 조회로 그린다 */ }
+    await providerPanel.refresh();
+    lastProviderSnap = providerPanel.snapshot?.() ?? lastProviderSnap;
+  }
+  if (!localAutoChecked && lastProviderSnap?.mode === 'local' && lastProviderSnap.status === 'localSelected' && !lastProviderSnap.busy) {
+    localAutoChecked = true;
+    paintChip();
+    try { await request('/api/provider/connect', {}); } catch { /* 결과는 아래 상태 조회로 그린다 */ }
+    await providerPanel.refresh();
+    lastProviderSnap = providerPanel.snapshot?.() ?? lastProviderSnap;
+    // 빈 대화면 가운데 첫 화면이 같은 안내를 크게 보여 주므로 알림은 이어 쓰는 대화에서만 띄운다.
+    if (lastProviderSnap?.status !== 'ready' && $('chat').querySelector('.message')) toast.show({ kind: 'warn', key: 'local-check', title: '이 PC의 AI가 아직 준비되지 않았습니다',
+      detail: '왼쪽 아래 AI 칸을 눌러 「준비 시작」을 하거나, 수업용 AI로 바꿔 쓰세요.', actions: [{ label: 'AI 준비하기', primary: true, run: () => modelDialog.open('local') }, { label: '수업용 AI로 쓰기', run: () => void useCloud() }], timeoutMs: 0 });
+  }
+  if (lastProviderSnap) localSetupPanel?.markConnected?.(lastProviderSnap.mode === 'local' && lastProviderSnap.status === 'ready' && lastProviderSnap.localRuntime === 'ollama', lastProviderSnap.model);
+  paintChip();
+}
+async function refreshMcp() {
+  $('mcp-controls').hidden=!mcpEnabled; $('mcp-unavailable').hidden=true;
+  if(!mcpEnabled) { mcpPanel?.dispose();mcpPanel=null;$('mcp-panel').replaceChildren();return; }
+  if(!mcpPanel) {
+    const id=projectId;
+    const bound=createGuiApi(document.querySelector('meta[name="wb-session"]').content,globalThis.fetch,()=>id);
+    const action=async(action,service)=>{
+      if(busy||projectId!==id)throw new Error('WB_GUI_BUSY');controls(true);
+      try{return await bound('/api/mcp-lab',{action,service});}finally{if(projectId===id)controls(false);}
+    };
+    mcpPanel=bindConnectionPanel({container:$('mcp-panel'),request:{
+      listConnections:()=>{if(projectId!==id)throw new Error('WB_GUI_PROJECT_STALE');return bound('/api/mcp-lab');},
+      connect:service=>action('connect',service),cancel:service=>action('cancel',service),
+    }});
+  }
+  await mcpPanel.refresh();
+}
+async function refreshChanges() {
+  const id = projectId, list = await request('/api/changes');
+  if (id !== projectId) return;
+  renderChangeSummary($('changes-summary'), list.changes); $('changes-list').replaceChildren();
+  $('changes-limit').textContent = list.omitted ? '기록 한도를 넘어 추가 변경 ' + list.omitted + '건은 비교 기록에 남기지 못했습니다.' : '';
+  for (const [index, row] of list.changes.entries()) {
+    const button = document.createElement('button'); button.className = 'btn'; button.textContent = describeChangeLabel(row,index+1);
+    button.addEventListener('click', async () => {
+      if(busy)return;clearRestoreCheck();
+      const read = ++changeRead;
+      try { const snapshot = await request('/api/change?id=' + encodeURIComponent(row.id)); if (id === projectId && read === changeRead) selectChange(snapshot); }
+      catch (error) { if (id === projectId && read === changeRead) status(friendlyError(error)); }
+    });
+    $('changes-list').append(button);
+  }
+}
+
+function paintFilePathMeta(info) {
+  const abs = $('file-absolute');
+  const openBtn = $('file-open-browser');
+  const openStatus = $('file-open-status');
+  if (!abs || !openBtn) return;
+  if (!info || typeof info.absolute !== 'string' || !info.absolute) {
+    abs.hidden = true;
+    abs.textContent = '';
+    openBtn.disabled = true;
+    openBtn.dataset.path = '';
+    if (openStatus) openStatus.textContent = '';
+    return;
+  }
+  abs.hidden = false;
+  abs.textContent = info.absolute;
+  const rel = typeof info.relative === 'string' ? info.relative : '';
+  const isHtml = /\.html?$/i.test(rel);
+  openBtn.disabled = !isHtml || busy || sendInFlight || reconnectInProgress;
+  openBtn.dataset.path = isHtml ? rel : '';
+  if (openStatus) openStatus.textContent = '';
+}
+
+async function refreshFilePathMeta(relativePath, expectedProjectId, expectedRead) {
+  try {
+    const info = await request('/api/files/path?path=' + encodeURIComponent(relativePath));
+    if (expectedProjectId !== projectId || expectedRead !== fileRead) return;
+    paintFilePathMeta(info);
+  } catch {
+    if (expectedProjectId !== projectId || expectedRead !== fileRead) return;
+    paintFilePathMeta(null);
+  }
+}
+
+async function showFile(path) {
+  const id = projectId, read = ++fileRead;
+  try {
+    const file = await request('/api/file?path=' + encodeURIComponent(path));
+    if (id !== projectId || read !== fileRead) return;
+    selectedFile = file.path;
+    $('file-name').textContent = file.path;
+    $('file-content').textContent = file.content;
+    try { runPanel?.setFile?.(file.path); } catch {}
+    await refreshFilePathMeta(file.path, id, read);
+  } catch (error) {
+    if (id !== projectId || read !== fileRead) return;
+    selectedFile = null;
+    $('file-name').textContent = typeof path === 'string' ? path : '파일';
+    $('file-content').textContent = '';
+    paintFilePathMeta(null);
+    status(friendlyError(error));
+  }
+}
+function paintFileLinks(thisTurnPaths) {
+  const mount = $('file-links-panel');
+  if (!mount) return;
+  const turn = filterProjectPaths(thisTurnPaths, availableFiles);
+  const paths = turn.length ? turn : filterProjectPaths(availableFiles, availableFiles);
+  renderFileLinks(mount, {
+    paths,
+    thisTurnPaths: turn,
+    onOpen: (path) => { showFile(path).catch((error) => status(friendlyError(error))); },
+    emptyText: availableFiles.length ? '' : '서버에 표시할 프로젝트 파일이 없습니다.',
+  });
+}
+async function presentDeliverable(result) {
+  const thisTurn = Array.isArray(result?.changedFiles) ? result.changedFiles : lastChangedFiles;
+  paintFileLinks(thisTurn);
+  const changed = filterProjectPaths(thisTurn, availableFiles);
+  if (!changed.length) return;
+  const next = chooseDeliverablePath({ changedFiles: changed, availableFiles, selectedFile });
+  if (!next) return;
+  try { await showFile(next); } catch (error) { status(friendlyError(error)); }
+}
+async function refreshAttachmentDraft(conversationId, { force = false } = {}) {
+  const expectedProjectId = projectId;
+  const changed = attachmentProjectId !== expectedProjectId || activeConversationId !== conversationId;
+  if (changed) {
+    attachmentRead++;
+    attachmentProjectId = expectedProjectId;
+    activeConversationId = conversationId;
+    attachmentReady = false;
+    attachmentPanel.rebind({ projectId: expectedProjectId, conversationId });
+  }
+  if (!conversationId) {
+    $('attachment-status').textContent = '대화가 준비되면 첨부를 사용할 수 있습니다.';
+    controls(busy);
+    return false;
+  }
+  if (!changed && !force && attachmentReady) return true;
+  const read = ++attachmentRead;
+  attachmentReady = false;
+  controls(busy);
+  try {
+    const list = await request('/api/attachments');
+    if (read !== attachmentRead || projectId !== expectedProjectId || activeConversationId !== conversationId) return false;
+    if (list?.conversationId !== conversationId || !Array.isArray(list.draft)) throw new Error('WB_ATTACH_LIST');
+    attachmentPanel.rebind({ projectId: expectedProjectId, conversationId, draft: list.draft });
+    attachmentReady = true;
+    $('attachment-status').textContent = '';
+    return true;
+  } catch {
+    if (read !== attachmentRead || projectId !== expectedProjectId || activeConversationId !== conversationId) return false;
+    // Keep registered draft IDs visible on a same-conversation read failure.
+    $('attachment-status').textContent = '첨부 상태를 확인하지 못했습니다. 전송 전에 다시 확인해 주세요.';
+    return false;
+  } finally {
+    if (read === attachmentRead && projectId === expectedProjectId && activeConversationId === conversationId) controls(busy);
+  }
+}
+async function refresh() {
+  const state = await request('/api/state');
+  renderUpdateBanner($('update-banner'), state.update);
+  renderUsageLine($('usage-line'), state.usage);
+  // 수업용 AI 가 답한 직후에는 서버가 금액을 새로 묻는 중이다. 한 번만 조금 뒤에 금액 줄을 다시 그린다
+  // (계속 도는 타이머는 두지 않는다 — 화면이 쉬고 있으면 아무것도 하지 않는다).
+  if (state.usage?.status && state.usage.status !== 'none') {
+    clearTimeout(usageRedrawTimer);
+    usageRedrawTimer = setTimeout(() => { request('/api/state').then(next => renderUsageLine($('usage-line'), next.usage)).catch(() => {}); }, 15_000);
+  }
+  if (projectId !== state.projectId) { if (projectId) drafts.set(projectId, $('prompt').value); $('prompt').value = drafts.get(state.projectId) ?? ''; clearProjectView(); }
+  projectId = state.projectId ?? ''; projectSelectionEnabled = state.projectSelectionEnabled === true;
+  $('project-name').textContent = state.projectName;
+  $('mode-label').textContent = state.mode === 'local' ? '로컬 우선' : state.mode === 'personal' ? '개인 모델' : 'CLCO';
+  $('model-label').textContent = ['aleph/auto','clco/auto'].includes(state.model) ? '자동 선택' : state.model;
+  previewEnabled = state.previewEnabled === true;
+  restoreEnabled=state.restoreEnabled===true;
+  $('restore-note').textContent=restoreEnabled?'기존 파일의 기록된 변경만 되돌릴 수 있습니다. 확인 후 별도로 승인해야 하며 새 파일 삭제는 지원하지 않습니다.':'실제 되돌리기는 --allow-restore 옵션으로 허용합니다.';
+  mcpEnabled = state.mcpLabEnabled === true;
+  $('preview-note').textContent = previewEnabled ? 'HTML·CSS 화면 캡처 · JavaScript와 외부 연결은 실행하지 않습니다.' : '정적 미리보기는 --allow-preview 옵션으로 허용합니다.';
+  $('capability-note').textContent = '명령 ' + (state.commandsEnabled ? '허용' : '꺼짐') + ' · 에이전트 브라우저 ' + (state.browserEnabled ? '허용' : '꺼짐') + ' · 정적 미리보기 ' + (previewEnabled ? '허용' : '꺼짐');
+  await refreshAttachmentDraft(state.historySelectedId ?? null);
+  // conversation rendered after /api/files so knownFiles can become links
+  renderConversationHistory($('conversation-history'), state, async id => {
+    if (busy || sendInFlight) return;
+    controls(true);
+    try { clearIntentHint(); await request('/api/conversations/select', { id }); await refresh(); status('선택한 대화 내용을 불러왔습니다. 파일 상태는 변경하지 않았습니다.'); }
+    catch (error) { status(friendlyError(error)); }
+    finally { controls(false); }
+  });
+  $('history-status').textContent = describeHistory(state);
+  $('project-note').textContent = state.persistenceEnabled ? '대화는 프로젝트별로 이 PC에 저장됩니다. 이전 대화를 선택해 이어갈 수 있습니다. 비밀번호나 API 키는 채팅에 입력하지 마세요.' : '현재 대화 저장이 꺼져 있습니다. 프로그램을 종료하면 대화는 남지 않습니다.';
+  controls(state.busy);
+  if (projectSelectionEnabled) {
+    const catalog = await request('/api/projects');
+    renderProjectOptions($('project-select'), catalog.projects, projectId);
+    projectMenu.setProjects(catalog.projects);
+  }
+  const files = await request('/api/files'); availableFiles = Array.isArray(files.files) ? files.files.filter((entry) => typeof entry === 'string') : []; $('files').replaceChildren();
+  const changedSet = new Set(Array.isArray(lastChangedFiles) ? lastChangedFiles.filter((entry) => typeof entry === 'string' && entry.length > 0) : []);
+  for (const path of availableFiles) {
+    const li = document.createElement('li'), button = document.createElement('button');
+    button.textContent = changedSet.has(path) ? path + ' · 이번 요청 변경' : path;
+    if (changedSet.has(path)) button.dataset.changed = '1';
+    button.addEventListener('click', async () => { try { await showFile(path); } catch (error) { status(friendlyError(error)); } });
+    li.append(button); $('files').append(li);
+  }
+  if (selectedFile && availableFiles.includes(selectedFile)) await showFile(selectedFile);
+  renderConversation($('chat'), state.turns, { knownFiles: availableFiles, onOpenFile: (path) => { showFile(path).catch((error) => status(friendlyError(error))); } });
+  paintEmpty();
+  $('chat').scrollTop = $('chat').scrollHeight;
+  paintFileLinks(lastChangedFiles);
+  await refreshChanges();
+  await refreshEnrollment();
+  await refreshRun();
+  await refreshBrowserControl();
+  await refreshWindowsApp();
+  await refreshModelTools();
+  bindFileFinderPanel({ getProjectId: () => projectId, showFile, status });
+  await refreshProvider();
+  await refreshMcp();
+  if (!servicePanel) servicePanel = bindServicePanel({ container: $('service-panel'), isBusy: () => busy || sendInFlight, request: { state: () => request('/api/services'), connect: body => request('/api/services/connect', body), disconnect: service => request('/api/services/disconnect', { service }),
+    targets: body => request('/api/services/targets', body), importOpen: () => request('/api/services/import/open', {}), importAll: () => request('/api/services/import', {}) } });
+  await servicePanel.refresh();
+  if (!localSetupPanel) localSetupPanel = bindLocalSetupPanel({ container: $('local-setup-panel'), request: { state: () => request('/api/local-setup'), inspect: () => request('/api/local-setup/inspect', {}), confirm: body => request('/api/local-setup/confirm', body), plan: () => request('/api/local-setup/plan', {}),
+    download: () => request('/api/local-setup/download', {}), open: () => request('/api/local-setup/open', {}), refreshInstaller: () => request('/api/local-setup/refresh', {}),
+    startRuntime: () => request('/api/local-setup/start-runtime', {}),
+    models: () => request('/api/local-setup/models'),
+    pull: body => request('/api/local-setup/pull', body), verify: body => request('/api/local-setup/verify', body),
+    activate: async body => { await request('/api/local-setup/activate', body); return request('/api/local-setup'); },
+    cancel: () => request('/api/local-setup/cancel', {}) },
+    onProgress: summary => { localSetupSummary = summary; paintChip(); },
+    onNotify: note => toast.show({ ...note, key: 'local-setup', actions: note.kind === 'err' ? [{ label: '해결 방법 보기', primary: true, run: () => modelDialog.open('local') }] : [] }),
+    onUseCloud: () => void useCloud(),
+    onChanged: async () => {
+      await refreshProvider();
+      const state = await request('/api/state');
+      $('mode-label').textContent = state.mode === 'local' ? '로컬 우선' : state.mode === 'personal' ? '개인 모델' : 'CLCO';
+      $('model-label').textContent = ['aleph/auto', 'clco/auto'].includes(state.model) ? '자동 선택' : state.model;
+      await alephConnectGate?.sync({ recheck: true });
+    } });
+  await localSetupPanel.refresh();
+  if (!alephConnectGate) {
+    alephConnectGate = bindAlephConnectGate({
+      root: document.getElementById('aleph-connect-root') || document.body,
+      request: {
+        stateEnrollment: () => request('/api/enrollment'),
+        startEnrollment: () => request('/api/enrollment/start', {}),
+        stateProvider: () => request('/api/provider'),
+        connectProvider: () => request('/api/provider/connect', {}),
+        stateWorkspace: () => request('/api/state'),
+        // 로컬로 돌아가면 바로 연결까지 확인해 왼쪽 아래 AI 칸이 「확인 중」에 머물지 않게 한다.
+        useLocal: async () => { await request('/api/provider/mode', { mode: 'local' }); try { await request('/api/provider/connect', {}); } catch { /* 상태 칸이 결과를 보여 준다 */ } await refreshProvider(); toast.dismissKey('cloud'); },
+      },
+    });
+  }
+  await alephConnectGate.sync();
+  if (!connectionRecovery) connectionRecovery = bindConnectionRecovery({
+    container: $('connection-recovery'),
+    request: { state: () => request('/api/state'), connect: () => request('/api/provider/connect', {}) },
+    isBusy: () => busy || sendInFlight || reconnectInProgress,
+    onChecking: value => { reconnectInProgress = value; controls(busy); },
+    onChecked: async () => { await refreshProvider(); await alephConnectGate.sync({ recheck: true, allowConnect: false }); },
+  });
+}
+// 보낸 글을 ALEPH 포털이 판단(의도·막힘)해 도움이 될 때만 입력창 위에 안내를 띄운다.
+// 보내기와 나란히 돌고(기다리지 않음), 실패하면 조용히 아무것도 하지 않는다. 같은 대화에서 같은 안내는 한 번만.
+const shownHints = new Set();
+function clearIntentHint() { const bar = $('intent-hint-bar'); if (bar) { bar.replaceChildren(); bar.hidden = true; } }
+async function showIntentHint(prompt, conversationId, attachmentCount) {
+  try {
+    const bar = $('intent-hint-bar'); if (!bar || typeof prompt !== 'string' || !prompt.trim()) return;
+    const expectedProject = projectId;
+    let result = null;
+    try { result = (await request('/api/intent', { message: prompt.slice(0, 1000) }))?.hint ?? null; } catch { result = null; }
+    const mode = lastProviderSnap?.mode ?? 'local';
+    let windowConnected = null;
+    if (result?.intent === 'pc_control' && mode === 'local') {
+      try { windowConnected = Boolean((await request('/api/windows-app'))?.window); } catch { windowConnected = null; }
+    }
+    let kind = chooseIntentHint({ result, prompt, mode, windowConnected, attachmentCount });
+    // 연결하지 않은 서비스(GitHub·Supabase·Vercel 등)를 이야기하면 연결 화면으로 안내한다.
+    const service = !kind ? mentionedService(prompt) : null;
+    if (service) {
+      try { const rows = (await request('/api/services'))?.services ?? []; const row = rows.find(item => (item.id || item.service) === service);
+        if (row && !['connected', 'ready'].includes(row.status)) kind = 'service'; } catch { /* 안내는 덤이다. */ }
+    }
+    const key = (conversationId ?? 'none') + ':' + kind;
+    // 그사이 다른 프로젝트로 옮겼으면 띄우지 않는다(대답하는 동안에는 대화를 바꿀 수 없다).
+    if (!kind || shownHints.has(key) || projectId !== expectedProject) return;
+    shownHints.add(key);
+    const card = renderIntentHint(bar, kind, { onAction: id => {
+      clearIntentHint();
+      if (id === 'open-model') openModelDialog();
+      else if (id === 'open-connections') connectionsDialog.open();
+      else if (id === 'attach') $('attachment-panel').querySelector('[data-pick]')?.click();
+    } });
+    const attachButton = card?.querySelector('[data-hint-action="attach"]');
+    if (attachButton) { attachButton.disabled = $('attachment-controls').disabled; attachButton.title = '대답이 끝나면 누를 수 있습니다'; }
+  } catch { /* 안내는 덤이다. 실패해도 대화에는 영향이 없다. */ }
+}
+// 이 PC의 AI가 아직 연결 전이면 보내기 전에 한 번 연결해 본다. 그래도 안 되면 보내지 않고
+// 입력한 글은 그대로 둔 채 무엇을 하면 되는지 알려 준다(보낸 뒤에야 오류를 보는 일을 막는다).
+// 확인이 필요 없으면 곧바로 true를 돌려준다(기다림 없이 보내기가 이어지도록). 필요하면 Promise를 돌려준다.
+function ensureLocalAiReady() {
+  const snap = lastProviderSnap;
+  if (!snap || snap.mode !== 'local' || snap.status === 'ready' || snap.busy || localSetupSummary.state === 'run') return true;
+  return connectLocalBeforeSend();
+}
+async function connectLocalBeforeSend() {
+  status('이 PC의 AI 연결을 확인하고 있습니다.');
+  try { await request('/api/provider/connect', {}); } catch { /* 아래에서 상태로 판단한다 */ }
+  try { await refreshProvider(); } catch { /* 마지막으로 받은 상태를 쓴다 */ }
+  if (lastProviderSnap?.status === 'ready') return true;
+  const reason = friendlyError(lastProviderSnap?.lastError || 'WB_GUI_PROVIDER_NOT_READY');
+  status(IDLE_NEED_AI);
+  toast.show({ kind: 'err', key: 'ai-missing', title: 'AI가 연결되지 않아 보내지 않았습니다', detail: reason + ' 입력한 내용은 입력창에 그대로 있습니다.',
+    actions: [{ label: 'AI 연결하기', primary: true, run: openModelDialog }, { label: '수업용 AI로 쓰기', run: () => void useCloud() }] });
+  return false;
+}
+// #1257: an exception anywhere after sendInFlight=true (connection check, draft refresh,
+// result rendering) used to leave send, new conversation and stop all disabled until reload.
+async function sendOnce() {
+  const submittedDraft = $('prompt').value, submittedProjectId = projectId, submittedConversationId = activeConversationId;
+  const submittedAttachmentIds = attachmentPanel.getDraftIds();
+  const prompt = submittedDraft.trim(); if (!prompt || busy) return;
+  if ($('attachment-panel').querySelector('[data-upload]')?.disabled === false) {
+    status('선택한 파일을 먼저 첨부 등록하거나 선택을 해제해 주세요.');
+    return;
+  }
+  if (submittedAttachmentIds.length && (!attachmentReady || !submittedConversationId)) {
+    status('첨부 상태를 확인한 뒤 전송해 주세요.');
+    return;
+  }
+  sendInFlight = true; controls(busy);
+  const aiReady = ensureLocalAiReady();
+  if (aiReady !== true && !(await aiReady)) { sendInFlight = false; controls(busy); return; }
+  if (connectionRecovery && !(await connectionRecovery.beforeSend())) { sendInFlight = false; controls(busy); return; }
+  if (projectId !== submittedProjectId || activeConversationId !== submittedConversationId || $('prompt').value !== submittedDraft ||
+      attachmentPanel.getDraftIds().join(',') !== submittedAttachmentIds.join(',')) { sendInFlight = false; controls(busy); status('연결 확인 중 입력이나 대화가 바뀌었습니다. 현재 내용을 확인한 뒤 전송해 주세요.'); return; }
+  if (alephConnectGate && !alephConnectGate.isUnlocked()) { sendInFlight = false; controls(busy); status(FRIENDLY_WB.WB_GUI_PROVIDER_NOT_READY); return; }
+  changeRead++;clearRestoreCheck();
+  controls(true); $('prompt').value = ''; const pendingMessage = message('user',prompt); startWork(); status('요청을 처리하고 있습니다.');
+  clearIntentHint(); void showIntentHint(prompt, submittedConversationId, submittedAttachmentIds.length);
+  const stopPoll = pollEvents(request, event => {
+    if (event.type === 'attachment_progress') status(event.completed === event.total
+      ? `문서 ${event.total}개 구간을 읽었습니다. 답변을 종합하는 중 · 중지 가능`
+      : `긴 문서 분석 중 · ${event.total}개 구간 중 ${event.completed}개 완료 · 중지 가능`);
+    else if (event.type === 'request') status('AI가 답을 만들고 있습니다' + (event.step > 1 ? ` · ${event.step}번째 단계` : '') + ' · 「중지」로 멈출 수 있습니다');
+    else { const label = TOOL_LABELS[event.name] || event.name; status((event.ok ? '처리 완료 · ' : '처리 오류 · ') + label); workStep((event.ok ? '✓ ' : '✗ ') + label); }
+    void refreshProvider().catch(() => {});
+  }, () => status('작업 상태를 확인하지 못했습니다.'));
+  let result, problem;
+  let sendFailure;
+  const sendBody = submittedAttachmentIds.length
+    ? { prompt, conversationId: submittedConversationId, attachmentIds: submittedAttachmentIds }
+    : { prompt };
+  let stoppedByStudent = false;
+  stopRequested = false;
+  try { result = await request('/api/send', sendBody); } catch (error) {
+    // 학생이 「중지」를 눌러 멈춘 것은 오류가 아니다.
+    stoppedByStudent = stopRequested || /_CANCELLED$/.test(error?.code ?? '');
+    sendFailure = stoppedByStudent ? '대답을 멈췄습니다. 보낸 글은 입력창에 다시 넣어 두었습니다.' : friendlyError(error); problem = sendFailure;
+  }
+  finally { controls(false); stopPoll(); endWork(); }
+  if (!sendFailure && submittedAttachmentIds.length && projectId === submittedProjectId && activeConversationId === submittedConversationId) {
+    if (!(await refreshAttachmentDraft(submittedConversationId, { force: true }))) {
+      problem = '응답을 받았지만 첨부 초안 상태를 확인하지 못했습니다. 다시 전송하기 전에 목록을 확인해 주세요.';
+    }
+  }
+  if (result && Array.isArray(result.changedFiles)) lastChangedFiles = result.changedFiles.slice(0, 200);
+  else if (!sendFailure) lastChangedFiles = [];
+  try { await refresh(); } catch (error) { problem ??= error.message; }
+  if (!sendFailure && projectId === submittedProjectId) await presentDeliverable(result);
+  if (sendFailure) {
+    // Refresh rebuilds the chat from completed turns; keep a rejected request visible.
+    if (projectId === submittedProjectId) {
+      if (!$('prompt').value) $('prompt').value = submittedDraft;
+      if (!pendingMessage.isConnected) message('user', prompt);
+      if (stoppedByStudent) {
+        message('assistant', '대답을 멈췄습니다. 이미 만들거나 고친 파일은 그대로 남아 있습니다.');
+        toast.show({ kind: 'info', key: 'send', title: '대답을 멈췄습니다', detail: '보낸 글은 입력창에 다시 넣어 두었습니다. 고쳐서 다시 보낼 수 있습니다.' });
+      } else {
+        message('assistant', sendFailure + '\n\n요청은 자동으로 재전송하지 않았습니다.');
+        toast.show({ kind: 'err', key: 'send', title: '메시지를 보내지 못했습니다', detail: sendFailure + ' 입력한 내용은 입력창에 그대로 남겨 두었습니다.',
+          actions: [{ label: '다시 보내기', primary: true, run: () => $('send').click() }, { label: 'AI 설정 열기', run: openModelDialog }] });
+      }
+    } else if (!drafts.get(submittedProjectId)) {
+      drafts.set(submittedProjectId, submittedDraft);
+    }
+  }
+  if (result && result.status !== 'completed') message('assistant', '정상 완료로 처리되지 않은 작업입니다 (' + result.status + '). 아래 모델 응답과 실제 작업 상태가 다를 수 있습니다.\n\n' + (result.content || '작업을 완료하지 못했습니다.'));
+  const contextNotice = describeContext(result?.context);
+  status(problem || (result?.reportIncomplete ? describeRunResult(result, { projectFileCount: availableFiles.length }) + ' 실행 보고서는 일부만 저장됐거나 저장하지 못했습니다.' + (result.stored === true ? ' 완료 응답은 대화에 유지됩니다.' : '') : describeRunResult(result, { projectFileCount: availableFiles.length })) + (contextNotice ? ' ' + contextNotice : ''));
+  sendInFlight = false; controls(busy);
+  if (sendFailure && !stoppedByStudent) void connectionRecovery?.check('failure');
+}
+$('send').addEventListener('click', async () => {
+  if (sendInFlight || reconnectInProgress || attachmentRequestInFlight) return;
+  try { await sendOnce(); }
+  catch (error) { status(friendlyError(error)); }
+  finally { endWork(); if (sendInFlight) { sendInFlight = false; controls(false); } }
+});
+let stopRequested = false;
+$('stop').addEventListener('click',async()=>{ stopRequested = true; clearApproval(); status('멈추고 있습니다.'); try { const result = await request('/api/stop',{}); try { await refresh(); } catch {} status(result?.ok === false ? '일부 작업을 멈추지 못했습니다. 잠시 뒤 「중지」를 다시 눌러 주세요. 계정 정보와 프로젝트 파일은 그대로입니다.' : '멈췄습니다. 이미 바뀐 파일은 「설정·문제 해결」의 파일 변경 비교에서 확인할 수 있습니다.'); try { await refreshChanges(); } catch {} } catch(error) { status(friendlyError(error)); } });
+async function newConversation() { if (busy || sendInFlight) return; clearApproval(); clearIntentHint(); controls(true); try { await request('/api/conversations/create',{}); await refresh(); status('기존 대화를 기록에 남기고 새 대화를 시작합니다.'); } catch(error) { status(friendlyError(error)); } finally { controls(false); } }
+$('reset').addEventListener('click', newConversation);
+$('new-conversation').addEventListener('click', newConversation);
+// Enter로 보내고 Shift+Enter로 줄을 바꾼다(다른 AI 채팅과 같게). 한글 조합 중인 Enter는 글자 확정이므로 보내지 않는다.
+$('prompt').addEventListener('keydown',event=>{
+  if (event.key !== 'Enter' || event.isComposing || event.keyCode === 229) return;
+  if (event.ctrlKey || (!event.shiftKey && !event.altKey && !event.metaKey)) { event.preventDefault(); $('send').click(); }
+});
+// 복사한 그림(캡처 도구·스크린샷 등)이나 파일을 입력창에 붙여 넣거나 끌어다 놓으면 「＋ 첨부」와 똑같이 올린다.
+// 글만 붙여 넣으면 평소처럼 글이 들어간다. 대답하는 동안에는 첨부 칸이 잠기므로 이유를 알려 준다.
+function attachFromComposer(files, how) {
+  if (!files.length) return false;
+  if ($('attachment-controls').disabled || attachmentPanel.isBusy()) {
+    toast.show({ kind: 'warn', key: 'paste-attach', title: `지금은 ${how} 파일을 첨부할 수 없습니다`,
+      detail: 'AI가 대답하는 중이거나 첨부를 올리는 중입니다. 끝난 뒤(또는 「중지」를 누른 뒤) 다시 해 주세요.' });
+    return true;
+  }
+  void attachmentPanel.addFiles(files);
+  return true;
+}
+$('prompt').addEventListener('paste', event => {
+  const files = clipboardFiles(event.clipboardData);
+  if (files.length && attachFromComposer(files, '붙여 넣은')) event.preventDefault();
+});
+const composer = $('prompt').closest('form') ?? $('prompt').parentElement;
+composer?.addEventListener('dragover', event => { if ([...(event.dataTransfer?.types ?? [])].includes('Files')) event.preventDefault(); });
+composer?.addEventListener('drop', event => {
+  const files = clipboardFiles(event.dataTransfer);
+  if (files.length) { event.preventDefault(); attachFromComposer(files, '끌어다 놓은'); }
+});
+renderPreview($('preview-content'), null);
+renderChangeSummary($('changes-summary'), []); renderChangeView($('change-detail'), null);
+bindProjectCreate({
+  container: $('project-create'),
+  request: {
+    create: (name) => request('/api/projects/create', { name }),
+    cancel: () => request('/api/projects/create/cancel', {}),
+  },
+  onCreated: async (result) => {
+    drafts.set(projectId, $('prompt').value);
+    projectId = result.projectId;
+    $('prompt').value = drafts.get(projectId) ?? '';
+    clearProjectView();
+    projectMenu.close();
+    try { await refresh(); status('새 프로젝트를 만들고 선택했습니다.'); toast.show({ kind: 'ok', title: `「${result.name ?? '새'}」 프로젝트를 만들었습니다`, detail: '이제 이 프로젝트 폴더에서 작업합니다.' }); }
+    finally { controls(false); }
+  },
+  onError: () => {},
+});
+bindProjectSwitch({ select: $('project-select'), button: $('project-switch'), currentId: () => projectId,
+  request: async (url, body) => {
+    if (busy) throw new Error('WB_GUI_BUSY'); controls(true); status('프로젝트를 전환하고 있습니다.');
+    try { return await request(url, body); } catch (error) { controls(false); throw error; }
+  },
+  onSelected: async result => {
+    drafts.set(projectId, $('prompt').value); projectId = result.projectId; $('prompt').value = drafts.get(projectId) ?? ''; clearProjectView();
+    try { await refresh(); status('프로젝트를 전환했습니다. 파일은 그대로이며 대화는 프로젝트별로 유지됩니다.'); }
+    finally { controls(false); }
+  },
+  onError: text => { controls(false); status(text); toast.show({ kind: 'err', title: '프로젝트를 바꾸지 못했습니다', detail: text }); },
+});
+const projectMenu = bindProjectMenu({
+  button: $('project-menu-button'), popover: $('project-popover'), list: $('project-list'), statusEl: $('project-list-status'),
+  currentId: () => projectId, isBusy: () => busy || sendInFlight || reconnectInProgress,
+  onSwitch: async id => { $('project-select').value = id; $('project-switch').disabled = false; $('project-switch').click(); },
+  onDelete: async (id, name) => {
+    if (busy || sendInFlight) return;
+    controls(true); status('프로젝트를 지우고 있습니다.');
+    let result;
+    try { result = await request('/api/projects/delete', { id }); }
+    catch (error) {
+      const text = friendlyError(error); status(text); projectMenu.status(text);
+      toast.show({ kind: 'err', title: '프로젝트를 지우지 못했습니다', detail: text });
+      controls(false); return;
+    }
+    if (result.projectId !== projectId) { drafts.set(projectId, $('prompt').value); projectId = result.projectId; $('prompt').value = drafts.get(projectId) ?? ''; clearProjectView(); }
+    drafts.delete(id); projectMenu.status('');
+    toast.show({ kind: 'ok', title: `「${name}」 프로젝트를 지웠습니다`, detail: '폴더는 워크벤치 데이터 폴더의 project-trash로 옮겨 두었습니다. 필요하면 강사에게 되살려 달라고 요청하세요.' });
+    status('프로젝트를 지웠습니다.');
+    try { await refresh(); } catch (error) { status(friendlyError(error)); }
+    finally { controls(false); }
+  },
+});
+
+$('file-open-browser')?.addEventListener('click', async () => {
+  if (busy || sendInFlight || reconnectInProgress) return;
+  const path = $('file-open-browser').dataset.path;
+  const openStatus = $('file-open-status');
+  if (typeof path !== 'string' || !/\.html?$/i.test(path)) {
+    if (openStatus) openStatus.textContent = 'HTML 파일을 선택하세요.';
+    return;
+  }
+  // Open the tab during the user's click. Awaiting the server first can lose
+  // browser activation, and window.open(..., 'noopener') returns null even on
+  // successful opens in Chrome, so that return value cannot report success.
+  const opened = window.open('about:blank', '_blank');
+  if (!opened) {
+    if (openStatus) openStatus.textContent = '팝업이 막혔습니다. 브라우저에서 팝업을 허용해 주세요.';
+    status('브라우저 팝업이 차단되었습니다.');
+    return;
+  }
+  try {
+    opened.opener = null;
+    $('file-open-browser').disabled = true;
+    if (openStatus) openStatus.textContent = '브라우저에서 여는 중…';
+    const result = await request('/api/preview/open', { path });
+    let target;
+    try { target = new URL(result?.url); } catch { /* handled below */ }
+    if (!target || target.protocol !== 'http:' || target.hostname !== '127.0.0.1' || !target.port || target.username || target.password) {
+      throw new Error('WB_GUI_PREVIEW_OPEN_FAILED');
+    }
+    // Local UI only: absolute stays on screen; do not post paths to chat/channel.
+    if (result.absolute) paintFilePathMeta({ absolute: result.absolute, relative: result.relative || path });
+    if (opened.closed) throw new Error('WB_GUI_PREVIEW_OPEN_FAILED');
+    opened.location.replace(target.href);
+    if (openStatus) openStatus.textContent = '브라우저 탭을 열었습니다. 정적 미리보기와 다릅니다.';
+    status('사용자용 브라우저 탭에서 프로젝트 HTML을 열었습니다.');
+  } catch (error) {
+    try { opened.close(); } catch {}
+    if (openStatus) openStatus.textContent = '열지 못했습니다.';
+    status(friendlyError(error));
+  } finally {
+    const rel = $('file-open-browser').dataset.path;
+    $('file-open-browser').disabled = !rel || busy || sendInFlight || reconnectInProgress;
+  }
+});
+
+bindPreviewActions({ openButton: $('preview-open'), refreshButton: $('preview-refresh'),
+  choosePath: () => selectedFile ?? (availableFiles.includes('index.html') ? 'index.html' : ''),
+  request: async (url, body) => {
+    if (busy || !previewEnabled) throw new Error('WB_GUI_BUSY');
+    controls(true); status('전용 브라우저에서 정적 화면을 캡처하고 있습니다.');
+    try { return await request(url, body); } finally { controls(false); }
+  },
+  onResult: result => { renderPreview($('preview-content'), result); status('정적 미리보기 완료 · JavaScript 동작 검사는 포함하지 않습니다.'); },
+  onError: status,
+});
+// 첫 안내 줄: AI가 준비됐을 때만 「준비됐습니다」라고 쓴다. 연결 전이면 연결 방법을 알려 준다.
+refresh().then(()=>idleStatus()).catch(error=>status(friendlyError(error)));
+// 새 버전 확인은 시작 직후 몇 초 걸린다. 한 번 더 상태만 읽어 알림 띠를 갱신한다(화면의 다른 부분은 건드리지 않는다).
+setTimeout(() => { request('/api/state').then(state => { renderUpdateBanner($('update-banner'), state.update); renderUsageLine($('usage-line'), state.usage); }).catch(() => {}); }, 10_000);
